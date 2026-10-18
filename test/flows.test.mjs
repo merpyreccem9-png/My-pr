@@ -525,6 +525,23 @@ test('ИИ-диалог: запрос к API, markdown→HTML, память [[re
   assert.equal(body2.messages.at(-1).content, 'а как меня зовут?');
 });
 
+test('ИИ: модель не принимает max_tokens/temperature — бот сам повторяет запрос с допустимыми параметрами', async () => {
+  await setupAi();
+  const err = (message) => jsonResponse({ error: { message } }, 400);
+  mockFetch(async (_url, init) => {
+    const b = JSON.parse(init.body);
+    if ('max_tokens' in b) return err("Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.");
+    if ('temperature' in b) return err("Unsupported value: 'temperature' does not support 0.7 with this model.");
+    return jsonResponse({ choices: [{ message: { content: 'Готово' } }] });
+  });
+  await send(pmsg(OWNER, 'привет'));
+  assert.equal(lastText(), 'Готово');
+  assert.equal(fetchCalls.length, 3);
+  const last = JSON.parse(fetchCalls[2].init.body);
+  assert.ok(last.max_completion_tokens > 0);
+  assert.ok(!('max_tokens' in last) && !('temperature' in last));
+});
+
 test('персона и имя попадают в системный промпт; /new сбрасывает историю, но не факты', async () => {
   await setupAi();
   aiReply('ок');

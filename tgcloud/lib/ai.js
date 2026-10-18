@@ -66,14 +66,36 @@ export async function checkQuota(userId) {
   if (row.n > AI_DAILY_LIMIT) throw new AiError('quota', String(AI_DAILY_LIMIT));
 }
 
+// Новые модели OpenAI (семейство GPT-5) не принимают max_tokens и нестандартную temperature.
+// Если API отвечает 400 на такой параметр — убираем/заменяем его и повторяем запрос.
+function adaptParams(body, raw) {
+  if ('max_tokens' in body && /max_completion_tokens/.test(raw)) {
+    // Лимит включает «рассуждения» модели, поэтому берём с запасом.
+    body.max_completion_tokens = body.max_tokens * 4;
+    delete body.max_tokens;
+    return true;
+  }
+  if ('temperature' in body && /temperature/.test(raw)) {
+    delete body.temperature;
+    return true;
+  }
+  return false;
+}
+
 async function complete(cfg, messages) {
-  const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-    body: JSON.stringify({ model: cfg.model, messages, max_tokens: AI_MAX_TOKENS, temperature: 0.7 }),
-  });
-  const raw = await res.text();
-  if (!res.ok) throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
+  const body = { model: cfg.model, messages, max_tokens: AI_MAX_TOKENS, temperature: 0.7 };
+  let res, raw;
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify(body),
+    });
+    raw = await res.text();
+    if (res.ok) break;
+    if (res.status === 400 && attempt < 2 && adaptParams(body, raw)) continue;
+    throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
+  }
   let data;
   try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
   const out = data?.choices?.[0]?.message?.content;
