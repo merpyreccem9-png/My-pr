@@ -5,7 +5,7 @@ import messageHandler from '../tgcloud/handlers/message.js';
 import callbackHandler from '../tgcloud/handlers/callback_query.js';
 import inlineHandler from '../tgcloud/handlers/inline_query.js';
 import memberHandler from '../tgcloud/handlers/my_chat_member.js';
-import { OWNER_IDS } from '../tgcloud/lib/config.js';
+import { OWNER_IDS, AI_DAILY_LIMIT } from '../tgcloud/lib/config.js';
 import { touchUser, setChat } from '../tgcloud/lib/store.js';
 import { checkQuota, AiError } from '../tgcloud/lib/ai.js';
 import {
@@ -603,12 +603,12 @@ test('ошибка API ИИ: детали видит только владеле
   assert.match(lastText(), /недоступен/);
 });
 
-test('суточный лимит: на 41-м запросе отказ, на следующий день счётчик сбрасывается, владелец без лимита', async () => {
-  for (let i = 0; i < 40; i++) await checkQuota(8);
+test('суточный лимит: на запросе сверх лимита отказ, на следующий день счётчик сбрасывается, владелец без лимита', async () => {
+  for (let i = 0; i < AI_DAILY_LIMIT; i++) await checkQuota(8);
   await assert.rejects(() => checkQuota(8), (e) => e instanceof AiError && e.code === 'quota');
 
   const row = dump('usage')[0];
-  assert.equal(row.n, 41);
+  assert.equal(row.n, AI_DAILY_LIMIT + 1);
   await db.update(usage).set({ day: '2000-01-01' }).run();
   await checkQuota(8);
   assert.equal(dump('usage')[0].n, 1);
@@ -622,9 +622,9 @@ test('лимит в диалоге: вежливое сообщение, зап�
   await setupAi();
   aiReply('ок');
   const guest = U(8, 'Гость');
-  for (let i = 0; i < 40; i++) await checkQuota(guest.id);
+  for (let i = 0; i < AI_DAILY_LIMIT; i++) await checkQuota(guest.id);
   await send(pmsg(guest, 'привет'));
-  assert.match(lastText(), /лимит ИИ-запросов \(40\) исчерпан/);
+  assert.match(lastText(), new RegExp(`лимит ИИ-запросов \\(${AI_DAILY_LIMIT}\\) исчерпан`));
   assert.equal(fetchCalls.length, 0);
 });
 

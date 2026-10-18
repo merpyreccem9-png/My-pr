@@ -6,7 +6,7 @@ export const OWNER_IDS = [8875047670];
 export const isOwner = (id) => OWNER_IDS.includes(id);
 
 // ИИ
-export const AI_DAILY_LIMIT = 40;   // запросов в сутки на пользователя (владелец без лимита)
+export const AI_DAILY_LIMIT = 150;  // запросов в сутки на пользователя (владелец без лимита)
 export const AI_MAX_TOKENS = 700;   // максимум токенов в ответе
 export const AI_HISTORY = 16;       // сколько последних реплик уходит в модель
 export const AI_MAX_FACTS = 30;     // долговременных фактов на пользователя
