@@ -691,6 +691,7 @@ test('/start rp из inline-кнопки показывает список РП'
 
 // ── Luna + effort extra, картинки, голос ───────────────────────────────────
 
+const lastImg = () => dump('kv').find((r) => r.key.startsWith('img.'))?.value?.split('|')[0] || null;
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4, 5, 6, 7]);
 const JPG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 9, 8, 7, 6]);
 const b64 = (u8) => Buffer.from(u8).toString('base64');
@@ -793,7 +794,7 @@ test('«нарисуй …»: модель вызывает generate_image → �
 
   const h = dump('history');
   assert.match(h[1].content, /нарисовал картинку: a cat in a hat/);
-  assert.match(dump('users')[0].lastImage, /^out-photo-/);   // можно сразу править результат
+  assert.match(lastImg(), /^out-photo-/);   // можно сразу править результат
 });
 
 test('фото с подписью: модель видит картинку, edit_image → /images/edits с файлом и инструкцией', async () => {
@@ -830,7 +831,7 @@ test('фото без подписи ждёт инструкцию; следую
   await send(photoMsg(OWNER, undefined));
   assert.match(lastText(), /Принял/);
   assert.equal(fetchCalls.length, 0);                                   // ИИ не дёргали
-  assert.equal(dump('users')[0].lastImage, 'in-photo');
+  assert.equal(lastImg(), 'in-photo');
 
   aiReply('На фото мужчина.');
   await send(pmsg(OWNER, 'что на фото?'));
@@ -851,7 +852,7 @@ test('/edit правит последнюю картинку напрямую, /
   assert.equal(calls('sendPhoto')[0].photo.type, 'image/jpeg');
 
   await send(pmsg(OWNER, '/new'));
-  assert.equal(dump('users')[0].lastImage, null);
+  assert.equal(lastImg(), null);
   await send(pmsg(OWNER, '/edit ещё'));
   assert.match(lastText(), /Сначала пришлите картинку/);
 });

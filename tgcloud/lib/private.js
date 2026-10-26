@@ -5,7 +5,7 @@ import { users, chats, history } from '../schema.js';
 import { esc, maskKey } from './fmt.js';
 import { splitCommand, parseGender } from './parse.js';
 import { say, sayMarkdown, typing } from './tg.js';
-import { touchUser, patchUser, botUsername } from './store.js';
+import { touchUser, patchUser, botUsername, kvGetMany, kvSet } from './store.js';
 import {
   AiError, askAi, checkQuota, getAiConfig, setAiConfig, normEffort, addFact, forgetFact, clearHistory,
 } from './ai.js';
@@ -37,12 +37,19 @@ export async function handlePrivate(msg) {
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
-// file_id последней картинки, если она ещё «свежая».
-const recentImage = (user) =>
-  user.lastImage && user.lastImageAt && nowSec() - user.lastImageAt < AI_IMAGE_TTL ? user.lastImage : null;
+// Последняя картинка живёт в kv (`img.<id>` = "file_id|unix-секунды"), а не в таблице users —
+// так деплой не требует миграции базы.
+const imgKey = (userId) => `img.${userId}`;
 
-const rememberImage = (userId, fileId) =>
-  patchUser(userId, { lastImage: fileId ?? null, lastImageAt: fileId ? nowSec() : null });
+// file_id последней картинки, если она ещё «свежая».
+async function recentImage(user) {
+  const raw = (await kvGetMany([imgKey(user.tgId)]))[imgKey(user.tgId)];
+  if (!raw) return null;
+  const [fileId, at] = raw.split('|');
+  return fileId && nowSec() - Number(at) < AI_IMAGE_TTL ? fileId : null;
+}
+
+const rememberImage = (userId, fileId) => kvSet(imgKey(userId), fileId ? `${fileId}|${nowSec()}` : '');
 
 // opts.imageId — картинка, присланная прямо сейчас; opts.skipQuota — лимит уже списан (голосовые).
 export async function chat(msg, user, input, { imageId = null, skipQuota = false } = {}) {
@@ -54,7 +61,7 @@ export async function chat(msg, user, input, { imageId = null, skipQuota = false
     let src = null;
     if (imageId) src = await loadImage(imageId);
     else {
-      const recent = recentImage(user);
+      const recent = await recentImage(user);
       if (recent) src = await loadImage(recent).catch(() => null);   // file_id мог протухнуть — не страшно
     }
 
@@ -231,7 +238,7 @@ async function runCommand(msg, user, cmd) {
     }
     case 'edit': {
       if (!arg(cmd)) return void (await say(msg, 'Использование: <code>/edit что изменить</code> — после того как пришлёте картинку.'));
-      if (!recentImage(user)) return void (await say(msg, '📷 Сначала пришлите картинку (она хранится несколько минут).'));
+      if (!(await recentImage(user))) return void (await say(msg, '📷 Сначала пришлите картинку (она хранится несколько минут).'));
       return imageCommand(msg, user, { kind: 'edit', prompt: arg(cmd).slice(0, 4000), size: 'auto' });
     }
     case 'ai':
@@ -252,7 +259,7 @@ async function runCommand(msg, user, cmd) {
 async function imageCommand(msg, user, req) {
   try {
     await checkQuota(user.tgId, AI_IMAGE_QUOTA_COST);
-    const src = req.kind === 'edit' ? await loadImage(recentImage(user)) : null;
+    const src = req.kind === 'edit' ? await loadImage(await recentImage(user)) : null;
     await produceImage(msg, user, req, src, { charged: AI_IMAGE_QUOTA_COST });
   } catch (e) {
     await aiFailure(msg, user, e);

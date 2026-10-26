@@ -11,8 +11,6 @@ export const users = table('users', {
   persona:  text('persona'),                     // системный промпт-«стиль» ИИ
   aiMemory: boolean('ai_memory').default(true),  // писать ли историю диалога
   awaiting: text('awaiting'),                    // ждём ввод из меню: 'fact' | 'persona' | null
-  lastImage:   text('last_image'),               // file_id последней картинки (присланной или сгенерированной)
-  lastImageAt: integer('last_image_at'),         // unix-секунды; картинка живёт AI_IMAGE_TTL
   created:  created(),
 }, (t) => ({
   usernameIdx: index('idx_users_username').on(t.username),
