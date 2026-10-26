@@ -1,7 +1,7 @@
 // Настройки бота. Секреты (ключ ИИ) здесь НЕ хранятся — они задаются командой /setkey в личке.
 
 // Telegram ID владельцев бота. Узнать свой ID: напишите боту /id, затем впишите число сюда.
-export const OWNER_IDS = [];
+export const OWNER_IDS = [8875047670];
 
 export const isOwner = (id) => OWNER_IDS.includes(id);
 
