@@ -24,8 +24,12 @@ export const AI_DEFAULT_EFFORT = 'xhigh';        // none | minimal | low | mediu
 export const AI_REASONING_MAX_TOKENS = 25000;    // с рассуждением токены «мысли» тоже входят в лимит
 
 // Картинки и голос
-export const AI_IMAGE_MODEL = 'gpt-image-1';               // генерация и правка картинок
-export const AI_STT_MODEL = 'gpt-4o-transcribe';           // распознавание голосовых
+// gpt-image-1 отключён 23.10.2026; gpt-4o-transcribe устарел (отключение 26.02.2027).
+// Если у аккаунта нет первой модели списка, бот сам берёт следующую и запоминает рабочую.
+export const AI_IMAGE_FALLBACKS = ['gpt-image-2.5-sunburst', 'gpt-image-2'];
+export const AI_STT_FALLBACKS = ['gpt-transcribe', 'gpt-4o-mini-transcribe', 'gpt-4o-transcribe'];
+export const AI_IMAGE_MODEL = AI_IMAGE_FALLBACKS[0];       // генерация и правка картинок
+export const AI_STT_MODEL = AI_STT_FALLBACKS[0];           // распознавание голосовых
 export const AI_IMAGE_QUOTA_COST = 5;                      // сколько «запросов» стоит одна картинка
 export const AI_IMAGE_TTL = 600;                           // сек: последняя картинка доступна для «добавь/убери…»
 export const AI_MAX_FILE_BYTES = 15 * 1024 * 1024;         // максимум размера входящего файла

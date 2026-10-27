@@ -2,8 +2,8 @@
 // генерация и правка изображений через OpenAI-совместимый API.
 
 import { api, fetch, FormData, InputFile, BotApiError } from 'sdk';
-import { AiError } from './ai.js';
-import { AI_MAX_FILE_BYTES } from './config.js';
+import { AiError, setAiConfig } from './ai.js';
+import { AI_MAX_FILE_BYTES, AI_IMAGE_FALLBACKS, AI_STT_FALLBACKS } from './config.js';
 
 // ── base64 (btoa/atob в изолята может не быть — свой кодек) ─────────────────
 
@@ -119,6 +119,30 @@ function apiError(res, raw) {
   return new AiError('http', detail);
 }
 
+// «Модели нет / нет доступа / отключена» → пробуем следующую из списка и запоминаем рабочую.
+const isMissingModel = (e) =>
+  e instanceof AiError && e.code === 'http' && /model/i.test(e.detail)
+  && /does not exist|not found|have access|shut ?down|deprecated|invalid_value|not available/i.test(e.detail);
+
+async function withModelFallback(cfg, key, fallbacks, run) {
+  const order = [cfg[key], ...fallbacks.filter((m) => m !== cfg[key])];
+  let last;
+  for (const model of order) {
+    try {
+      const out = await run(model);
+      if (model !== cfg[key]) {
+        console.warn(`${key}: ${cfg[key]} недоступна, перешёл на ${model}`);
+        await setAiConfig({ [key]: model });
+      }
+      return out;
+    } catch (e) {
+      if (!isMissingModel(e)) throw e;
+      last = e;
+    }
+  }
+  throw last;
+}
+
 async function readBytes(res) {
   if (typeof res.arrayBuffer === 'function') return new Uint8Array(await res.arrayBuffer());
   const parts = [];
@@ -132,17 +156,19 @@ async function readBytes(res) {
 
 // Голос → текст.
 export async function transcribe(cfg, bytes, { filename, type }) {
-  const form = new FormData();
-  form.append('file', new InputFile(bytes, filename, { type }));
-  form.append('model', cfg.sttModel);
-  const res = await fetch(`${cfg.baseUrl}/audio/transcriptions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${cfg.apiKey}` },   // Content-Type с boundary выставит сама платформа
-    body: form,
+  return withModelFallback(cfg, 'sttModel', AI_STT_FALLBACKS, async (model) => {
+    const form = new FormData();
+    form.append('file', new InputFile(bytes, filename, { type }));
+    form.append('model', model);
+    const res = await fetch(`${cfg.baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },   // Content-Type с boundary выставит сама платформа
+      body: form,
+    });
+    const raw = await res.text();
+    if (!res.ok) throw apiError(res, raw);
+    try { return String(JSON.parse(raw).text ?? '').trim(); } catch { return raw.trim(); }
   });
-  const raw = await res.text();
-  if (!res.ok) throw apiError(res, raw);
-  try { return String(JSON.parse(raw).text ?? '').trim(); } catch { return raw.trim(); }
 }
 
 async function parseImage(res) {
@@ -163,29 +189,35 @@ async function parseImage(res) {
   return { bytes, mime: sniffMime(bytes) };
 }
 
-// Нарисовать новую картинку.
+// Нарисовать новую картинку. size 'auto' не отправляем — у новых моделей это значение по умолчанию.
 export async function generateImage(cfg, prompt, size = 'auto') {
-  const res = await fetch(`${cfg.baseUrl}/images/generations`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-    body: JSON.stringify({ model: cfg.imageModel, prompt, size, n: 1 }),
+  return withModelFallback(cfg, 'imageModel', AI_IMAGE_FALLBACKS, async (model) => {
+    const body = { model, prompt, n: 1 };
+    if (size && size !== 'auto') body.size = size;
+    const res = await fetch(`${cfg.baseUrl}/images/generations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify(body),
+    });
+    return parseImage(res);
   });
-  return parseImage(res);
 }
 
 // Изменить присланную картинку: добавить/убрать/заменить по описанию.
 export async function editImage(cfg, src, prompt) {
-  const form = new FormData();
-  form.append('model', cfg.imageModel);
-  form.append('prompt', prompt);
-  form.append('n', '1');
-  form.append('image', new InputFile(src.bytes, `image.${EXT[src.mime] ?? 'png'}`, { type: src.mime }));
-  const res = await fetch(`${cfg.baseUrl}/images/edits`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${cfg.apiKey}` },
-    body: form,
+  return withModelFallback(cfg, 'imageModel', AI_IMAGE_FALLBACKS, async (model) => {
+    const form = new FormData();
+    form.append('model', model);
+    form.append('prompt', prompt);
+    form.append('n', '1');
+    form.append('image', new InputFile(src.bytes, `image.${EXT[src.mime] ?? 'png'}`, { type: src.mime }));
+    const res = await fetch(`${cfg.baseUrl}/images/edits`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+      body: form,
+    });
+    return parseImage(res);
   });
-  return parseImage(res);
 }
 
 // ── Отправка результата ──────────────────────────────────────────────────

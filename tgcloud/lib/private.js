@@ -306,13 +306,13 @@ async function ownerCommand(msg, user, cmd) {
       return true;
     }
     case 'setimage': {
-      if (!cmd.args.trim()) { await say(msg, 'Использование: <code>/setimage gpt-image-1</code>'); return true; }
+      if (!cmd.args.trim()) { await say(msg, 'Использование: <code>/setimage gpt-image-2</code>'); return true; }
       await setAiConfig({ imageModel: cmd.args.trim() });
       await say(msg, '✅ Модель картинок сохранена.');
       return true;
     }
     case 'setstt': {
-      if (!cmd.args.trim()) { await say(msg, 'Использование: <code>/setstt gpt-4o-transcribe</code>'); return true; }
+      if (!cmd.args.trim()) { await say(msg, 'Использование: <code>/setstt gpt-transcribe</code>'); return true; }
       await setAiConfig({ sttModel: cmd.args.trim() });
       await say(msg, '✅ Модель распознавания голоса сохранена.');
       return true;

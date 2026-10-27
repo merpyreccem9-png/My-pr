@@ -795,7 +795,7 @@ test('«нарисуй …»: модель вызывает generate_image → �
 
   const gen = fetchCalls.find((c) => c.url.endsWith('/images/generations'));
   const gb = JSON.parse(gen.init.body);
-  assert.equal(gb.model, 'gpt-image-1');
+  assert.equal(gb.model, 'gpt-image-2.5-sunburst');
   assert.equal(gb.prompt, 'a cat in a hat');
   assert.equal(gb.size, '1024x1024');
   assert.equal(gen.init.headers.Authorization, 'Bearer sk-secret-12345');
@@ -831,7 +831,7 @@ test('фото с подписью: модель видит картинку, ed
   const edit = fetchCalls.find((c) => c.url.endsWith('/images/edits'));
   assert.equal(edit.init.headers['Content-Type'], undefined);          // boundary выставит платформа
   assert.equal(edit.init.body.get('prompt'), 'add a red hat on the man');
-  assert.equal(edit.init.body.get('model'), 'gpt-image-1');
+  assert.equal(edit.init.body.get('model'), 'gpt-image-2.5-sunburst');
   const file = edit.init.body.get('image');
   assert.deepEqual(file.bytes, JPG);
   assert.equal(file.type, 'image/jpeg');
@@ -896,7 +896,7 @@ test('голосовое: распознаётся, эхо в чат, дальш
 
   const stt = fetchCalls[0];
   assert.ok(stt.url.endsWith('/audio/transcriptions'));
-  assert.equal(stt.init.body.get('model'), 'gpt-4o-transcribe');
+  assert.equal(stt.init.body.get('model'), 'gpt-transcribe');
   assert.equal(stt.init.body.get('file').name, 'voice.ogg');
   assert.equal(stt.init.headers['Content-Type'], undefined);
   const texts = calls('sendMessage').map((m) => m.text).slice(-2);
@@ -1044,4 +1044,54 @@ test('лимиты выключены для всех: нет квоты, нет
   route({ '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }) });
   for (let i = 0; i < 20; i++) await send(pmsg(guest, '/img кот'));        // 20 картинок подряд
   assert.equal(calls('sendPhoto').length, 20);
+});
+
+test('/img: size=auto не отправляется; конкретный размер — отправляется', async () => {
+  await sendKeyOnly();
+  route({ '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }) });
+  await send(pmsg(OWNER, '/img кот'));
+  assert.equal('size' in JSON.parse(fetchCalls[0].init.body), false);
+});
+
+test('модель картинок отключена (gpt-image-1 shut down) → перебор запасных и запоминание рабочей', async () => {
+  await sendKeyOnly();
+  const seen = [];
+  mockFetch(async (url, init) => {
+    const model = JSON.parse(init.body).model;
+    seen.push(model);
+    return model === 'gpt-image-2'
+      ? jsonResponse({ data: [{ b64_json: b64(PNG) }] })
+      : jsonResponse({ error: { message: `The model '${model}' does not exist.`, code: 'invalid_value', param: 'model' } }, 400);
+  });
+  await send(pmsg(OWNER, '/img кот'));
+  assert.deepEqual(seen, ['gpt-image-2.5-sunburst', 'gpt-image-2']);
+  assert.equal(calls('sendPhoto').length, 1);
+  await send(pmsg(OWNER, '/aistatus'));
+  assert.match(lastText(), /Картинки: <code>gpt-image-2<\/code>/);
+  await send(pmsg(OWNER, '/img ещё кот'));
+  assert.deepEqual(seen, ['gpt-image-2.5-sunburst', 'gpt-image-2', 'gpt-image-2']);   // без повторных промахов
+});
+
+test('голос: gpt-transcribe недоступна → gpt-4o-mini-transcribe; ошибка не про модель сразу пробрасывается', async () => {
+  await sendKeyOnly();
+  fileBytes.set('in-voice', new Uint8Array([1, 2]));
+  const seen = [];
+  mockFetch(async (url, init) => {
+    if (url.endsWith('/audio/transcriptions')) {
+      const model = init.body.get('model');
+      seen.push(model);
+      return model === 'gpt-4o-mini-transcribe'
+        ? jsonResponse({ text: 'привет' })
+        : jsonResponse({ error: { message: `The model \`${model}\` does not exist or you do not have access to it.` } }, 404);
+    }
+    return jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'ок' }] }] });
+  });
+  await send(voiceMsg(OWNER));
+  assert.deepEqual(seen, ['gpt-transcribe', 'gpt-4o-mini-transcribe']);
+  assert.equal(lastText(), 'ок');
+
+  seen.length = 0;
+  mockFetch(async (url, init) => { seen.push(init.body.get('model')); return jsonResponse({ error: { message: 'Invalid file format' } }, 400); });
+  await send(voiceMsg(OWNER));
+  assert.equal(seen.length, 1);                                   // про формат файла — не перебираем модели
 });
