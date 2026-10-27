@@ -153,7 +153,14 @@ async function complete(cfg, messages, tools, unlimited = false) {
     body: JSON.stringify(body),
   });
   const raw = await res.text();
-  if (!res.ok) throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
+  if (!res.ok) {
+    // Модель без рассуждения (например, gpt-4o-mini) не знает reasoning_effort — повторяем обычным запросом.
+    if (cfg.effort && res.status === 400 && /reasoning_effort|max_completion_tokens/i.test(raw)) {
+      console.warn('model rejected reasoning params, retrying without them', cfg.model);
+      return complete({ ...cfg, effort: null }, messages, tools, unlimited);
+    }
+    throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
+  }
   let data;
   try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
   const message = data?.choices?.[0]?.message;

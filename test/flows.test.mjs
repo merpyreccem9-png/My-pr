@@ -972,3 +972,18 @@ test('владелец: лимит токенов на ответ не отпр�
   await send(pmsg(U(77, 'Гость'), 'привет'));
   assert.equal(JSON.parse(fetchCalls[1].init.body).max_completion_tokens, 25000);
 });
+
+test('модель без рассуждения отвергла reasoning_effort → тихий повтор без него', async () => {
+  await sendKeyOnly();
+  let n = 0;
+  mockFetch(async () => (++n === 1
+    ? jsonResponse({ error: { message: 'Unrecognized request argument supplied: reasoning_effort' } }, 400)
+    : jsonResponse({ choices: [{ message: { content: 'Привет!' } }] })));
+  await send(pmsg(OWNER, 'alo'));
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(JSON.parse(fetchCalls[0].init.body).reasoning_effort, 'xhigh');
+  const retry = JSON.parse(fetchCalls[1].init.body);
+  assert.equal(retry.reasoning_effort, undefined);
+  assert.equal(retry.temperature, 0.7);
+  assert.equal(lastText(), 'Привет!');
+});
