@@ -71,6 +71,24 @@ export const usage = table('usage', {
   n:      integer('n').notNull().default(0),
 });
 
+// Журнал запросов к ИИ (только для владельца: /stats, /log, /user). Хранится 30 дней.
+export const aiLog = table('ai_log', {
+  id:       integer('id').primaryKey({ autoIncrement: true }),
+  userId:   integer('user_id').notNull(),
+  username: text('username'),                    // в нижнем регистре, без @
+  name:     text('name'),
+  kind:     text('kind').notNull(),              // text | photo | voice | group | img-gen | img-edit
+  input:    text('input'),                       // первые 200 символов
+  model:    text('model'),
+  tin:      integer('tokens_in').notNull().default(0),
+  tout:     integer('tokens_out').notNull().default(0),    // в т.ч. «мысли»
+  tthink:   integer('tokens_think').notNull().default(0),
+  ts:       integer('ts').notNull(),             // unix-секунды
+}, (t) => ({
+  tsIdx:   index('idx_ai_log_ts').on(t.ts),
+  userIdx: index('idx_ai_log_user').on(t.userId, t.id),
+}));
+
 // Настройки бота: ai.base_url, ai.api_key, ai.model, ai.effort, ai.image_model, ai.stt_model, bot.username.
 export const kv = table('kv', {
   key:   text('k').primaryKey(),

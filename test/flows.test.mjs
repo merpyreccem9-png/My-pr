@@ -9,6 +9,8 @@ import { OWNER_IDS, LIMITS } from '../tgcloud/lib/config.js';
 import { touchUser, setChat } from '../tgcloud/lib/store.js';
 import { checkQuota, AiError, normEffort } from '../tgcloud/lib/ai.js';
 import { bytesToB64, b64ToBytes, sniffMime, pickMedia } from '../tgcloud/lib/media.js';
+import { deLatex } from '../tgcloud/lib/fmt.js';
+import { tables } from './stub-sdk-db.mjs';
 import {
   resetDb, resetApi, resetFetch, dump, db, apiCalls, members, apiFail, calls, lastText,
   mockFetch, fetchCalls, jsonResponse, fileBytes,
@@ -1094,4 +1096,166 @@ test('голос: gpt-transcribe недоступна → gpt-4o-mini-transcribe
   mockFetch(async (url, init) => { seen.push(init.body.get('model')); return jsonResponse({ error: { message: 'Invalid file format' } }, 400); });
   await send(voiceMsg(OWNER));
   assert.equal(seen.length, 1);                                   // про формат файла — не перебираем модели
+});
+
+// ── Математика без LaTeX ───────────────────────────────────────────────────
+
+test('deLatex: примеры из скриншота превращаются в читаемый текст', () => {
+  assert.equal(deLatex(String.raw`\(\log_2(\log_3 81)=\log_2 4=\boxed{2}\)`), 'log₂(log₃ 81)=log₂ 4=**2**');
+  assert.equal(deLatex(String.raw`\(\log_{10}(0{,}01)=\log_{10}10^{-2}=\boxed{-2}\)`), 'log₁₀(0,01)=log₁₀10⁻²=**-2**');
+  assert.equal(deLatex(String.raw`\(\frac12+\frac14=\boxed{\frac34}\)`), '½+¼=**¾**');
+  assert.equal(deLatex(String.raw`\(\log_{\sqrt3}\frac1{3\sqrt[3]3}\)`), 'log_(√3)1/(3∛3)');
+  assert.equal(deLatex(String.raw`\(\boxed{-\frac{22}{5}}\)`), '**-22/5**');
+  assert.equal(deLatex(String.raw`\(\log_{5^{-1/2}}5^{11/5}\)`), 'log_(5^(-1/2))5^(11/5)');
+  assert.equal(deLatex(String.raw`\[ x^2+1 \le 5 \cdot \pi \]`), '\nx²+1 ≤ 5 · π\n');
+  assert.equal(deLatex(String.raw`\(\sqrt{x+1}\) и \(\sqrt[4]{16}\)`), '√(x+1) и ∜16');
+});
+
+test('deLatex: обычный текст, пути, цены и код не трогает', () => {
+  const plain = ['Привет, как дела?', String.raw`Путь C:\Users\tom и перенос \n`, 'Цена $5 и $10', 'snake_case и a^b в тексте'];
+  for (const t of plain) assert.equal(deLatex(t), t);
+  const code = 'Вот код:\n```js\nconst s = "\\frac{1}{2}"; // a_b\n```\nи `\\sqrt{x}`';
+  assert.equal(deLatex(code), code);
+});
+
+test('ответ модели с LaTeX уходит в Telegram чистым текстом (и в историю тоже)', async () => {
+  await setupAi();
+  aiReply(String.raw`**291**
+1) \(\log_{10}(0{,}01)=\boxed{-2}\).
+5) \(\frac12+\frac14=\boxed{\frac34}\).`);
+  await send(pmsg(OWNER, 'реши'));
+  const t = lastText();
+  assert.doesNotMatch(t, /\\|boxed|frac/);
+  assert.match(t, /log₁₀\(0,01\)=<b>-2<\/b>/);
+  assert.match(t, /½\+¼=<b>¾<\/b>/);
+  assert.doesNotMatch(dump('history')[1].content, /\\/);
+});
+
+test('системный промпт: «ты в Telegram, а не в ChatGPT», LaTeX запрещён', async () => {
+  await setupAi();
+  aiReply('ок');
+  await send(pmsg(OWNER, 'привет'));
+  const sys = JSON.parse(fetchCalls[0].init.body).messages[0].content;
+  assert.match(sys, /НЕ в приложении ChatGPT/);
+  assert.match(sys, /ЗАПРЕЩЕНО/);
+  assert.match(sys, /Юникода/);
+});
+
+// ── Журнал запросов для владельца ───────────────────────────────────────────
+
+const VASYA2 = U(600, 'Вася', { username: 'Vasya' });
+const chatUsage = { prompt_tokens: 100, completion_tokens: 300, completion_tokens_details: { reasoning_tokens: 250 } };
+const aiReplyUsage = (content, usage = chatUsage) => mockFetch(async () => jsonResponse({ choices: [{ message: { content } }], usage }));
+
+test('журнал: запрос, юзернейм и токены (вход / ответ / мысли) записываются', async () => {
+  await setupAi();
+  aiReplyUsage('Привет!');
+  await send(pmsg(VASYA2, 'расскажи про котов'));
+  const [row] = dump('ai_log');
+  assert.equal(row.userId, 600);
+  assert.equal(row.username, 'vasya');
+  assert.equal(row.kind, 'text');
+  assert.equal(row.input, 'расскажи про котов');
+  assert.equal(row.model, 'gpt-test');
+  assert.deepEqual([row.tin, row.tout, row.tthink], [100, 300, 250]);
+  assert.ok(row.ts > 1_700_000_000);
+});
+
+test('журнал: /responses считает input_tokens / output_tokens / reasoning_tokens', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => jsonResponse({
+    output: [{ type: 'message', content: [{ type: 'output_text', text: 'ок' }] }],
+    usage: { input_tokens: 1200, output_tokens: 8800, output_tokens_details: { reasoning_tokens: 8000 } },
+  }));
+  await send(pmsg(VASYA2, 'сложный вопрос'));
+  const [row] = dump('ai_log');
+  assert.deepEqual([row.tin, row.tout, row.tthink], [1200, 8800, 8000]);
+  assert.equal(row.model, 'gpt-6-luna');
+});
+
+test('/stats, /log, /user — только владельцу, с юзернеймами и токенами', async () => {
+  await setupAi();
+  aiReplyUsage('Привет!');
+  await send(pmsg(VASYA2, 'расскажи про котов'));
+  aiReplyUsage('Ещё!', { prompt_tokens: 50, completion_tokens: 150, completion_tokens_details: { reasoning_tokens: 100 } });
+  await send(pmsg(VASYA2, 'и про собак'));
+
+  await send(pmsg(OWNER, '/stats'));
+  assert.match(lastText(), /Статистика ИИ/);
+  assert.match(lastText(), /24 часа: 2 запр\. · 600 ток\. \(вход 150 \/ ответ 450, из них мысли 350\)/);
+  assert.match(lastText(), /1\. @vasya — 2 запр\./);
+
+  await send(pmsg(OWNER, '/log'));
+  assert.match(lastText(), /@vasya \[текст\] «и про собак» · 200 ток\./);
+  assert.match(lastText(), /@vasya \[текст\] «расскажи про котов» · 400 ток\./);
+
+  for (const q of ['/user @Vasya', '/user 600']) {
+    await send(pmsg(OWNER, q));
+    assert.match(lastText(), /@vasya.*id <code>600<\/code>/);
+    assert.match(lastText(), /2 запр\. · 600 ток\./);
+    assert.match(lastText(), /«и про собак»/);
+  }
+  await send(pmsg(OWNER, '/user @nobody'));
+  assert.match(lastText(), /запросов за 30 дней нет/);
+  await send(pmsg(OWNER, '/user'));
+  assert.match(lastText(), /Использование/);
+
+  for (const c of ['/stats', '/log', '/user @vasya']) {
+    await send(pmsg(VASYA2, c));
+    assert.match(lastText(), /Не знаю такую команду/);
+  }
+});
+
+test('журнал: картинки, голос и группа попадают в журнал с нужным видом', async () => {
+  await sendKeyOnly();
+  route({
+    '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }),
+    '/audio/transcriptions': () => jsonResponse({ text: 'привет из голосового' }),
+    '/responses': () => jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'ок' }] }], usage: { input_tokens: 10, output_tokens: 20 } }),
+    '/chat/completions': () => jsonResponse({ choices: [{ message: { content: 'ок' } }], usage: { prompt_tokens: 5, completion_tokens: 6 } }),
+  });
+  fileBytes.set('in-voice', new Uint8Array([1, 2]));
+  await send(pmsg(VASYA2, '/img закат'));
+  await send(voiceMsg(VASYA2));
+  await send(gmsg('/ai привет'));
+  const kinds = dump('ai_log').map((r) => [r.kind, r.input]);
+  assert.deepEqual(kinds, [['img-gen', 'закат'], ['voice', 'привет из голосового'], ['group', 'привет']]);
+
+  await send(pmsg(OWNER, '/stats'));
+  assert.match(lastText(), /🖼 1/);                                      // картинки считаются отдельно
+  assert.match(lastText(), /24 часа: 2 запр\./);
+});
+
+test('журнал: нет таблицы (не сделан migrate) — ответы живы, /stats подсказывает migrate', async () => {
+  await setupAi();
+  const saved = tables.get('ai_log');
+  tables.delete('ai_log');
+  try {
+    aiReplyUsage('Всё работает');
+    await send(pmsg(VASYA2, 'привет'));
+    assert.equal(lastText(), 'Всё работает');
+    await send(pmsg(OWNER, '/stats'));
+    assert.match(lastText(), /npx tgcloud migrate/);
+    await send(pmsg(OWNER, '/log'));
+    assert.match(lastText(), /npx tgcloud migrate/);
+  } finally {
+    tables.set('ai_log', saved);
+  }
+});
+
+test('журнал: записи старше 30 дней стираются при новой записи; текст запроса режется до 200 символов', async () => {
+  await setupAi();
+  const t = tables.get('ai_log');
+  t.rows.push({ id: 900, userId: 1, username: 'old', name: 'Old', kind: 'text', input: 'давно', model: 'x', tin: 1, tout: 1, tthink: 0, ts: Math.floor(Date.now() / 1000) - 31 * 86400 });
+  t.rows.push({ id: 901, userId: 2, username: 'new', name: 'New', kind: 'text', input: 'недавно', model: 'x', tin: 1, tout: 1, tthink: 0, ts: Math.floor(Date.now() / 1000) - 29 * 86400 });
+  aiReplyUsage('ок');
+  await send(pmsg(VASYA2, 'я'.repeat(500)));
+  const rows = dump('ai_log');
+  assert.deepEqual(rows.map((r) => r.username).sort(), ['new', 'vasya']);
+  assert.equal(rows.find((r) => r.username === 'vasya').input.length, 200);
+});
+
+test('/start и /help предупреждают, что запросы сохраняются', async () => {
+  await send(pmsg(OLYA, '/help'));
+  assert.match(lastText(), /Запросы к ИИ сохраняются/);
 });

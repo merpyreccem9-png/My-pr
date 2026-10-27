@@ -4,6 +4,7 @@ import { db, fetch } from 'sdk';
 import { eq, and, asc, desc, lt, inArray, sql } from 'sdk/db';
 import { history, facts, usage } from '../schema.js';
 import { kvGetMany, kvSet } from './store.js';
+import { deLatex } from './fmt.js';
 import {
   AI_MAX_TOKENS, AI_HISTORY, AI_MAX_FACTS, AI_MAX_INPUT, AI_DAILY_LIMIT, LIMITS, isOwner,
   AI_DEFAULT_BASE_URL, AI_DEFAULT_MODEL, AI_DEFAULT_EFFORT, AI_REASONING_MAX_TOKENS, AI_IMAGE_MODEL, AI_STT_MODEL,
@@ -33,7 +34,11 @@ export function personaLabel(prompt) {
 
 const BASE_PROMPT = [
   'Ты — ИИ-ассистент в Telegram. Отвечай на языке пользователя, по делу и компактно (обычно до 1500 символов).',
-  'Форматирование: только простой markdown — **жирный**, `код`, блоки кода, списки через «-». Без таблиц и LaTeX.',
+  'Форматирование: только простой markdown — **жирный**, `код`, блоки кода, списки через «-». Без таблиц.',
+  'Ты отвечаешь в Telegram, а НЕ в приложении ChatGPT: формулы здесь не рисуются, LaTeX виден как мусор.',
+  'ЗАПРЕЩЕНО: \\( \\), \\[ \\], $…$, $$…$$, \\frac, \\sqrt, \\boxed, \\log и любые команды с обратным слэшем.',
+  'Математику пиши обычным текстом и символами Юникода: дроби через / (3/4), корень √ и ∛, степени x², 10⁻², индексы log₂, знаки × · ÷ ≤ ≥ ≠ ≈ π.',
+  'Решение — по шагам, каждый шаг с новой строки; итоговый ответ выдели **жирным**.',
   'Если пользователь сообщает устойчивый факт о себе (имя, город, профессия, предпочтения, цели), добавь в самый конец',
   'ответа отдельную строку [[remember: короткий факт]] (не больше одной за ответ).',
   'Не сохраняй чувствительное: здоровье, финансы, документы, пароли, адреса, интимные подробности.',
@@ -133,6 +138,13 @@ const IMAGE_PROMPT = [
   'Вместе с вызовом функции можно написать короткую подпись (1 фраза).',
 ].join(' ');
 
+// Токены из ответа API: вход, ответ (в него уже входят «мысли»), из них «мысли».
+const usageOf = (u, inKey, outKey, detailsKey) => ({
+  in: Number(u?.[inKey]) || 0,
+  out: Number(u?.[outKey]) || 0,
+  think: Number(u?.[detailsKey]?.reasoning_tokens) || 0,
+});
+
 async function completeChat(cfg, messages, tools, unlimited = false) {
   const body = { model: cfg.model, messages };
   if (cfg.effort) {
@@ -167,7 +179,7 @@ async function completeChat(cfg, messages, tools, unlimited = false) {
   const content = message?.content ? String(message.content).trim() : '';
   const call = message?.tool_calls?.[0]?.function;
   if (!content && !call) throw new AiError('empty');
-  return { content, call };
+  return { content, call, usage: usageOf(data.usage, 'prompt_tokens', 'completion_tokens', 'completion_tokens_details') };
 }
 
 // Модели с рассуждением не принимают функции в /chat/completions («Function tools with reasoning_effort are
@@ -229,7 +241,7 @@ async function completeResponses(cfg, messages, tools, unlimited) {
   const fc = out.find((o) => o.type === 'function_call');
   const call = fc ? { name: fc.name, arguments: fc.arguments } : undefined;
   if (!content && !call) throw new AiError('empty', data?.incomplete_details?.reason ?? data?.status ?? '');
-  return { content, call };
+  return { content, call, usage: usageOf(data.usage, 'input_tokens', 'output_tokens', 'output_tokens_details') };
 }
 
 // Вызов функции модели → запрос на картинку или null.
@@ -292,9 +304,9 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
   ];
   const tools = canImage ? [TOOL_GENERATE, ...(hasImage ? [TOOL_EDIT] : [])] : [];
 
-  const { content, call } = await complete(cfg, messages, tools, !LIMITS.enabled || isOwner(userId));
+  const { content, call, usage: tokens } = await complete(cfg, messages, tools, !LIMITS.enabled || isOwner(userId));
   const { text, found } = extractMemory(content);
-  const answer = text || content;
+  const answer = deLatex(text || content);    // модель любит LaTeX, а Telegram его не рисует
   const image = imageRequest(call, hasImage);
 
   const commit = async () => {
@@ -313,7 +325,7 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
     for (const f of found.slice(0, 1)) await addFact(userId, f, factRows);
   };
 
-  return { text: answer, image, commit };
+  return { text: answer, image, usage: tokens, model: cfg.model, commit };
 }
 
 // ── Долговременная память ────────────────────────────────────────────────

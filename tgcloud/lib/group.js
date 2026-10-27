@@ -14,6 +14,7 @@ import { showSettings } from './settings.js';
 import { HELP_GROUP, rpList } from './menu.js';
 import { AiError, askAi, checkQuota } from './ai.js';
 import { aiFailure } from './private.js';
+import { logAi } from './stats.js';
 import * as mod from './mod.js';
 
 const DEFAULT_WELCOME = '👋 Добро пожаловать, {name}!\nЗагляните в /rules и чувствуйте себя как дома.';
@@ -194,6 +195,7 @@ async function groupAi(msg, cmd) {
     await checkQuota(msg.from.id);
     typing(msg);
     const out = await askAi({ userId: msg.from.id, name: user.name, persona: user.persona, input: question, useMemory: false });
+    await logAi({ from: msg.from, kind: 'group', input: question, model: out.model, usage: out.usage });
     await sayMarkdown(msg, out.text);
   } catch (e) {
     if (e instanceof AiError) return void (await aiFailure(msg, user, e));

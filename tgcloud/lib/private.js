@@ -9,6 +9,7 @@ import { touchUser, patchUser, botUsername, kvGetMany, kvSet } from './store.js'
 import {
   AiError, askAi, checkQuota, getAiConfig, setAiConfig, normEffort, addFact, forgetFact, clearHistory,
 } from './ai.js';
+import { logAi, statsText, logText, userText } from './stats.js';
 import {
   pickMedia, loadImage, downloadFile, toDataUrl, transcribe, generateImage, editImage, sendImage,
 } from './media.js';
@@ -52,7 +53,7 @@ async function recentImage(user) {
 const rememberImage = (userId, fileId) => kvSet(imgKey(userId), fileId ? `${fileId}|${nowSec()}` : '');
 
 // opts.imageId — картинка, присланная прямо сейчас; opts.skipQuota — лимит уже списан (голосовые).
-export async function chat(msg, user, input, { imageId = null, skipQuota = false } = {}) {
+export async function chat(msg, user, input, { imageId = null, skipQuota = false, kind = 'text' } = {}) {
   try {
     if (!skipQuota) await checkQuota(user.tgId);
     typing(msg);
@@ -69,6 +70,7 @@ export async function chat(msg, user, input, { imageId = null, skipQuota = false
       userId: user.tgId, name: user.name, persona: user.persona, input, useMemory: user.aiMemory !== false,
       images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true,
     });
+    await logAi({ from: msg.from, kind, input, model: out.model, usage: out.usage });   // токены уже потрачены
     if (out.image) {
       if (out.text) await sayMarkdown(msg, out.text, { reply: false });
       await produceImage(msg, user, out.image, src);
@@ -92,6 +94,7 @@ async function produceImage(msg, user, req, src, { charged = 1 } = {}) {
     : await generateImage(cfg, req.prompt, req.size);
   const fileId = await sendImage(msg, result);
   await rememberImage(user.tgId, fileId);
+  await logAi({ from: msg.from, kind: req.kind === 'edit' && src ? 'img-edit' : 'img-gen', input: req.prompt, model: cfg.imageModel });
 }
 
 // ── Картинка от пользователя ─────────────────────────────────────────────
@@ -106,7 +109,7 @@ async function handleImage(msg, user, media) {
       `Картинка доступна ${Math.round(AI_IMAGE_TTL / 60)} мин.`));
   }
   await rememberImage(user.tgId, media.fileId);
-  return chat(msg, user, caption, { imageId: media.fileId });
+  return chat(msg, user, caption, { imageId: media.fileId, kind: 'photo' });
 }
 
 // ── Голосовые: распознаём и отвечаем как на текст ───────────────────────────
@@ -122,7 +125,7 @@ async function handleAudio(msg, user, media) {
     const text = await transcribe(cfg, bytes, { filename: media.name, type: media.mime });
     if (!text) return void (await say(msg, '🎤 Не удалось разобрать речь. Попробуйте записать ещё раз.'));
     await say(msg, `🎤 <i>${esc(text.slice(0, 1000))}</i>`, { reply: false });
-    return await chat(msg, user, text, { skipQuota: true });
+    return await chat(msg, user, text, { skipQuota: true, kind: 'voice' });
   } catch (e) {
     await aiFailure(msg, user, e);
   }
@@ -287,6 +290,15 @@ async function ownerCommand(msg, user, cmd) {
       // Ключ не должен оставаться в истории чата.
       await api.deleteMessage({ chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {});
       await say(msg, '🔑 Ключ сохранён, ваше сообщение с ключом удалено.');
+      return true;
+    }
+    case 'stats':
+    case 'log':
+    case 'user': {
+      const out = cmd.word === 'stats' ? await statsText()
+        : cmd.word === 'log' ? await logText(Number(cmd.args) || 15)
+          : await userText(cmd.args);
+      await say(msg, out ?? '⚠️ Журнал ещё не создан. Выполните <code>npx tgcloud migrate</code> и повторите.');
       return true;
     }
     case 'seteffort': {
