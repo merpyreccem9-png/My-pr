@@ -470,8 +470,12 @@ const setupAi = async () => {
   OWNER_IDS.push(OWNER.id);
   await send(pmsg(OWNER, '/setai https://api.example.com/v1/ gpt-test'));
   await send(pmsg(OWNER, '/setkey sk-secret-12345'));
+  await send(pmsg(OWNER, '/seteffort off'));
 };
-const aiReply = (content) => mockFetch(async () => jsonResponse({ choices: [{ message: { content } }] }));
+const aiReply = (content) => mockFetch(async () => jsonResponse({
+  choices: [{ message: { content } }],
+  output: [{ type: 'message', content: [{ type: 'output_text', text: content }] }],
+}));
 
 test('ИИ не настроен: владельцу подсказка, остальным — вежливо', async () => {
   await send(pmsg(U(8, 'Гость'), 'привет'));
@@ -700,6 +704,13 @@ const toolCall = (name, args, content = null) => ({
   choices: [{ message: { content, tool_calls: [{ id: 'c1', type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }],
 });
 // Простая «маршрутизация» ответов ИИ по адресу.
+const respCall = (name, args, text = '') => ({
+  output: [
+    { type: 'reasoning', summary: [] },
+    ...(text ? [{ type: 'message', content: [{ type: 'output_text', text }] }] : []),
+    { type: 'function_call', call_id: 'c1', name, arguments: JSON.stringify(args) },
+  ],
+});
 const route = (handlers) => mockFetch(async (url, init) => {
   const key = Object.keys(handlers).find((k) => url.endsWith(k));
   if (!key) throw new Error(`unexpected fetch ${url}`);
@@ -736,14 +747,16 @@ test('по умолчанию: gpt-6-luna, reasoning_effort xhigh, без temper
   await sendKeyOnly();
   aiReply('ок');
   await send(pmsg(OWNER, 'привет'));
-  assert.equal(fetchCalls[0].url, 'https://api.openai.com/v1/chat/completions');
+  // С инструментами и рассуждением — только /responses (в chat/completions OpenAI это запрещает).
+  assert.equal(fetchCalls[0].url, 'https://api.openai.com/v1/responses');
   const body = JSON.parse(fetchCalls[0].init.body);
   assert.equal(body.model, 'gpt-6-luna');
-  assert.equal(body.reasoning_effort, 'xhigh');
-  assert.equal(body.max_completion_tokens, undefined);   // владелец без лимита на ответ
+  assert.deepEqual(body.reasoning, { effort: 'xhigh' });
+  assert.equal(body.max_output_tokens, undefined);   // владелец без лимита на ответ
   assert.equal(body.temperature, undefined);
-  assert.equal(body.max_tokens, undefined);
-  assert.deepEqual(body.tools.map((t) => t.function.name), ['generate_image']);   // без картинки править нечего
+  assert.equal(body.input[0].role, 'developer');
+  assert.deepEqual(body.tools.map((t) => t.name), ['generate_image']);   // без картинки править нечего
+  assert.equal(body.tools[0].type, 'function');
 });
 
 test('/seteffort и /aistatus; off возвращает обычные max_tokens и temperature', async () => {
@@ -756,10 +769,11 @@ test('/seteffort и /aistatus; off возвращает обычные max_token
   await send(pmsg(OWNER, '/seteffort medium'));
   aiReply('ок');
   await send(pmsg(OWNER, 'привет'));
-  assert.equal(JSON.parse(fetchCalls[0].init.body).reasoning_effort, 'medium');
+  assert.deepEqual(JSON.parse(fetchCalls[0].init.body).reasoning, { effort: 'medium' });
   await send(pmsg(OWNER, '/seteffort off'));
   aiReply('ок');
   await send(pmsg(OWNER, 'ещё'));
+  assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));   // без effort — обычный путь
   const b = JSON.parse(fetchCalls[1].init.body);
   assert.equal(b.reasoning_effort, undefined);
   assert.equal(b.max_tokens, undefined);                  // владелец без лимита на ответ
@@ -774,7 +788,7 @@ test('/seteffort доступна только владельцу', async () => 
 test('«нарисуй …»: модель вызывает generate_image → картинка уходит фото, память хранит пометку', async () => {
   await sendKeyOnly();
   route({
-    '/chat/completions': () => jsonResponse(toolCall('generate_image', { prompt: 'a cat in a hat', size: '1024x1024' }, 'Держите!')),
+    '/responses': () => jsonResponse(respCall('generate_image', { prompt: 'a cat in a hat', size: '1024x1024' }, 'Держите!')),
     '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }),
   });
   await send(pmsg(OWNER, 'нарисуй кота в шляпе'));
@@ -802,17 +816,17 @@ test('фото с подписью: модель видит картинку, ed
   await sendKeyOnly();
   fileBytes.set('in-photo', JPG);
   route({
-    '/chat/completions': () => jsonResponse(toolCall('edit_image', { prompt: 'add a red hat on the man' })),
+    '/responses': () => jsonResponse(respCall('edit_image', { prompt: 'add a red hat on the man' })),
     '/images/edits': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }),
   });
   await send(photoMsg(OWNER, 'добавь ему красную шляпу'));
 
   const chatBody = JSON.parse(fetchCalls[0].init.body);
-  const content = chatBody.messages.at(-1).content;
-  assert.equal(content[0].text, 'добавь ему красную шляпу');
-  assert.equal(content[1].type, 'image_url');
-  assert.equal(content[1].image_url.url, `data:image/jpeg;base64,${b64(JPG)}`);
-  assert.deepEqual(chatBody.tools.map((t) => t.function.name), ['generate_image', 'edit_image']);
+  const content = chatBody.input.at(-1).content;
+  assert.deepEqual(content[0], { type: 'input_text', text: 'добавь ему красную шляпу' });
+  assert.equal(content[1].type, 'input_image');
+  assert.equal(content[1].image_url, `data:image/jpeg;base64,${b64(JPG)}`);
+  assert.deepEqual(chatBody.tools.map((t) => t.name), ['generate_image', 'edit_image']);
 
   const edit = fetchCalls.find((c) => c.url.endsWith('/images/edits'));
   assert.equal(edit.init.headers['Content-Type'], undefined);          // boundary выставит платформа
@@ -836,8 +850,8 @@ test('фото без подписи ждёт инструкцию; следую
 
   aiReply('На фото мужчина.');
   await send(pmsg(OWNER, 'что на фото?'));
-  const content = JSON.parse(fetchCalls[0].init.body).messages.at(-1).content;
-  assert.equal(content[1].image_url.url, `data:image/jpeg;base64,${b64(JPG)}`);
+  const content = JSON.parse(fetchCalls[0].init.body).input.at(-1).content;
+  assert.equal(content[1].image_url, `data:image/jpeg;base64,${b64(JPG)}`);
   assert.equal(lastText(), 'На фото мужчина.');
   assert.equal(calls('sendPhoto').length, 0);                            // просто описание — без картинки
 });
@@ -876,7 +890,7 @@ test('голосовое: распознаётся, эхо в чат, дальш
   fileBytes.set('in-voice', new Uint8Array([79, 103, 103, 83]));
   route({
     '/audio/transcriptions': () => jsonResponse({ text: 'Привет, как дела?' }),
-    '/chat/completions': () => jsonResponse({ choices: [{ message: { content: 'Отлично!' } }] }),
+    '/responses': () => jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Отлично!' }] }] }),
   });
   await send(voiceMsg(OWNER));
 
@@ -888,7 +902,7 @@ test('голосовое: распознаётся, эхо в чат, дальш
   const texts = calls('sendMessage').map((m) => m.text).slice(-2);
   assert.equal(texts[0], '🎤 <i>Привет, как дела?</i>');
   assert.equal(texts[1], 'Отлично!');
-  assert.equal(JSON.parse(fetchCalls[1].init.body).messages.at(-1).content, 'Привет, как дела?');
+  assert.equal(JSON.parse(fetchCalls[1].init.body).input.at(-1).content, 'Привет, как дела?');
 });
 
 test('голосовое от обычного пользователя: квота списывается 1 раз, не 2', async () => {
@@ -897,7 +911,7 @@ test('голосовое от обычного пользователя: кво�
   fileBytes.set('in-voice', new Uint8Array([1, 2]));
   route({
     '/audio/transcriptions': () => jsonResponse({ text: 'привет' }),
-    '/chat/completions': () => jsonResponse({ choices: [{ message: { content: 'ок' } }] }),
+    '/responses': () => jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'ок' }] }] }),
   });
   OWNER_IDS.length = 0;
   await send(voiceMsg(U(99)));
@@ -964,29 +978,51 @@ test('владелец: лимит токенов на ответ не отпр�
   aiReply('ок');
   await send(pmsg(OWNER, 'привет'));
   const o = JSON.parse(fetchCalls[0].init.body);
-  assert.equal(o.max_completion_tokens, undefined);
-  assert.equal(o.max_tokens, undefined);
-  assert.equal(o.reasoning_effort, 'xhigh');
+  assert.equal(o.max_output_tokens, undefined);
+  assert.deepEqual(o.reasoning, { effort: 'xhigh' });
 
   OWNER_IDS.length = 0;
   aiReply('ок');
   await send(pmsg(U(77, 'Гость'), 'привет'));
-  assert.equal(JSON.parse(fetchCalls[1].init.body).max_completion_tokens, 25000);
+  assert.equal(JSON.parse(fetchCalls[1].init.body).max_output_tokens, 25000);
 });
 
-test('модель без рассуждения отвергла reasoning_effort → тихий повтор без него', async () => {
+test('chat/completions: модель без рассуждения отвергла reasoning_effort → тихий повтор без него', async () => {
   await sendKeyOnly();
   let n = 0;
   mockFetch(async () => (++n === 1
     ? jsonResponse({ error: { message: 'Unrecognized request argument supplied: reasoning_effort' } }, 400)
     : jsonResponse({ choices: [{ message: { content: 'Привет!' } }] })));
-  await send(pmsg(OWNER, 'alo'));
+  await send(gmsg('/ai alo'));                       // в группе инструментов нет → /chat/completions
   assert.equal(fetchCalls.length, 2);
   assert.equal(JSON.parse(fetchCalls[0].init.body).reasoning_effort, 'xhigh');
   const retry = JSON.parse(fetchCalls[1].init.body);
   assert.equal(retry.reasoning_effort, undefined);
   assert.equal(retry.temperature, 0.7);
   assert.equal(lastText(), 'Привет!');
+});
+
+test('/responses недоступен или не знает reasoning → запасной chat/completions с effort=none и функциями', async () => {
+  await sendKeyOnly();
+  for (const [status, msg] of [[404, 'not found'], [400, 'Unsupported parameter: reasoning.effort']]) {
+    resetFetch();
+    route({
+      '/responses': () => jsonResponse({ error: { message: msg } }, status),
+      '/chat/completions': () => jsonResponse({ choices: [{ message: { content: 'Привет!' } }] }),
+    });
+    await send(pmsg(OWNER, 'alo'));
+    const b = JSON.parse(fetchCalls[1].init.body);
+    assert.equal(b.reasoning_effort, 'none');
+    assert.deepEqual(b.tools.map((t) => t.function.name), ['generate_image']);
+    assert.equal(lastText(), 'Привет!');
+  }
+});
+
+test('/responses: пустой ответ и «incomplete» дают понятную ошибку, а не тишину', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => jsonResponse({ status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [{ type: 'reasoning', summary: [] }] }));
+  await send(pmsg(OWNER, 'alo'));
+  assert.match(lastText(), /Ошибка ИИ \(empty\)/);
 });
 
 test('лимиты выключены для всех: нет квоты, нет потолка токенов, ввод не режется', async () => {
@@ -1001,8 +1037,8 @@ test('лимиты выключены для всех: нет квоты, нет
   aiReply('ок');
   await send(pmsg(guest, 'я'.repeat(6000)));
   const b = JSON.parse(fetchCalls[0].init.body);
-  assert.equal(b.max_completion_tokens, undefined);
-  assert.equal(b.messages.at(-1).content.length, 6000);
+  assert.equal(b.max_output_tokens, undefined);
+  assert.equal(b.input.at(-1).content.length, 6000);
   assert.equal(lastText(), 'ок');
 
   route({ '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }) });

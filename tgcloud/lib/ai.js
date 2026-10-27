@@ -133,7 +133,7 @@ const IMAGE_PROMPT = [
   'Вместе с вызовом функции можно написать короткую подпись (1 фраза).',
 ].join(' ');
 
-async function complete(cfg, messages, tools, unlimited = false) {
+async function completeChat(cfg, messages, tools, unlimited = false) {
   const body = { model: cfg.model, messages };
   if (cfg.effort) {
     // Модели с рассуждением: max_completion_tokens (в него входят и токены «мысли»), temperature только без рассуждения.
@@ -157,7 +157,7 @@ async function complete(cfg, messages, tools, unlimited = false) {
     // Модель без рассуждения (например, gpt-4o-mini) не знает reasoning_effort — повторяем обычным запросом.
     if (cfg.effort && res.status === 400 && /reasoning_effort|max_completion_tokens/i.test(raw)) {
       console.warn('model rejected reasoning params, retrying without them', cfg.model);
-      return complete({ ...cfg, effort: null }, messages, tools, unlimited);
+      return completeChat({ ...cfg, effort: null }, messages, tools, unlimited);
     }
     throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
   }
@@ -167,6 +167,68 @@ async function complete(cfg, messages, tools, unlimited = false) {
   const content = message?.content ? String(message.content).trim() : '';
   const call = message?.tool_calls?.[0]?.function;
   if (!content && !call) throw new AiError('empty');
+  return { content, call };
+}
+
+// Модели с рассуждением не принимают функции в /chat/completions («Function tools with reasoning_effort are
+// not supported»), поэтому запрос с инструментами и effort идёт в /responses; остальное — в /chat/completions.
+async function complete(cfg, messages, tools, unlimited = false) {
+  const reasoning = cfg.effort && cfg.effort !== 'none';
+  if (reasoning && tools?.length) return completeResponses(cfg, messages, tools, unlimited);
+  return completeChat(cfg, messages, tools, unlimited);
+}
+
+const toResponsesInput = (messages) => messages.map((m) => ({
+  role: m.role === 'system' ? 'developer' : m.role,
+  content: typeof m.content === 'string'
+    ? m.content
+    : m.content.map((part) => (part.type === 'text'
+      ? { type: 'input_text', text: part.text }
+      : { type: 'input_image', image_url: part.image_url.url })),
+}));
+
+const toResponsesTools = (tools) => tools.map((t) => ({
+  type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters,
+}));
+
+async function completeResponses(cfg, messages, tools, unlimited) {
+  const body = {
+    model: cfg.model,
+    input: toResponsesInput(messages),
+    reasoning: { effort: cfg.effort },
+    tools: toResponsesTools(tools),
+    tool_choice: 'auto',
+    store: false,
+  };
+  if (!unlimited) body.max_output_tokens = AI_REASONING_MAX_TOKENS;   // «мысли» тоже входят в лимит
+
+  const res = await fetch(`${cfg.baseUrl}/responses`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+    body: JSON.stringify(body),
+  });
+  const raw = await res.text();
+  if (!res.ok) {
+    // Провайдер без /responses или модель без рассуждения: обычный запрос с effort=none (функции там разрешены).
+    if (res.status === 404 || res.status === 405 || (res.status === 400 && /reasoning/i.test(raw))) {
+      console.warn('/responses not usable, falling back to chat/completions', res.status, cfg.model);
+      return completeChat({ ...cfg, effort: 'none' }, messages, tools, unlimited);
+    }
+    throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
+  }
+  let data;
+  try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
+  const out = Array.isArray(data?.output) ? data.output : [];
+  const content = out
+    .filter((o) => o.type === 'message')
+    .flatMap((o) => (Array.isArray(o.content) ? o.content : []))
+    .filter((c) => c.type === 'output_text' && c.text)
+    .map((c) => c.text)
+    .join('')
+    .trim();
+  const fc = out.find((o) => o.type === 'function_call');
+  const call = fc ? { name: fc.name, arguments: fc.arguments } : undefined;
+  if (!content && !call) throw new AiError('empty', data?.incomplete_details?.reason ?? data?.status ?? '');
   return { content, call };
 }
 
