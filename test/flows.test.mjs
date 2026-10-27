@@ -5,7 +5,7 @@ import messageHandler from '../tgcloud/handlers/message.js';
 import callbackHandler from '../tgcloud/handlers/callback_query.js';
 import inlineHandler from '../tgcloud/handlers/inline_query.js';
 import memberHandler from '../tgcloud/handlers/my_chat_member.js';
-import { OWNER_IDS } from '../tgcloud/lib/config.js';
+import { OWNER_IDS, LIMITS } from '../tgcloud/lib/config.js';
 import { touchUser, setChat } from '../tgcloud/lib/store.js';
 import { checkQuota, AiError, normEffort } from '../tgcloud/lib/ai.js';
 import { bytesToB64, b64ToBytes, sniffMime, pickMedia } from '../tgcloud/lib/media.js';
@@ -36,6 +36,7 @@ const adminMember = (u) => ({
 beforeEach(() => {
   resetDb(); resetApi(); resetFetch();
   OWNER_IDS.length = 0;
+  LIMITS.enabled = true;   // тесты проверяют поведение с лимитами; без них — отдельный тест ниже
   members.set(`${GROUP.id}:${ADMIN.id}`, adminMember(ADMIN));
   // Telegram возвращает настоящие данные пользователя — повторяем это в заглушке.
   for (const u of [VASYA, PETYA]) members.set(`${GROUP.id}:${u.id}`, { status: 'member', user: u });
@@ -986,4 +987,25 @@ test('модель без рассуждения отвергла reasoning_effo
   assert.equal(retry.reasoning_effort, undefined);
   assert.equal(retry.temperature, 0.7);
   assert.equal(lastText(), 'Привет!');
+});
+
+test('лимиты выключены для всех: нет квоты, нет потолка токенов, ввод не режется', async () => {
+  LIMITS.enabled = false;
+  const guest = U(500, 'Гость');
+  for (let i = 0; i < 100; i++) await checkQuota(guest.id);                // не бросает
+  assert.equal(dump('usage').length, 0);
+
+  OWNER_IDS.push(OWNER.id);
+  await send(pmsg(OWNER, '/setkey sk-secret-12345'));
+  OWNER_IDS.length = 0;
+  aiReply('ок');
+  await send(pmsg(guest, 'я'.repeat(6000)));
+  const b = JSON.parse(fetchCalls[0].init.body);
+  assert.equal(b.max_completion_tokens, undefined);
+  assert.equal(b.messages.at(-1).content.length, 6000);
+  assert.equal(lastText(), 'ок');
+
+  route({ '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }) });
+  for (let i = 0; i < 20; i++) await send(pmsg(guest, '/img кот'));        // 20 картинок подряд
+  assert.equal(calls('sendPhoto').length, 20);
 });

@@ -5,7 +5,7 @@ import { eq, and, asc, desc, lt, inArray, sql } from 'sdk/db';
 import { history, facts, usage } from '../schema.js';
 import { kvGetMany, kvSet } from './store.js';
 import {
-  AI_MAX_TOKENS, AI_HISTORY, AI_MAX_FACTS, AI_MAX_INPUT, AI_DAILY_LIMIT, isOwner,
+  AI_MAX_TOKENS, AI_HISTORY, AI_MAX_FACTS, AI_MAX_INPUT, AI_DAILY_LIMIT, LIMITS, isOwner,
   AI_DEFAULT_BASE_URL, AI_DEFAULT_MODEL, AI_DEFAULT_EFFORT, AI_REASONING_MAX_TOKENS, AI_IMAGE_MODEL, AI_STT_MODEL,
 } from './config.js';
 
@@ -76,7 +76,7 @@ export async function setAiConfig({ baseUrl, model, apiKey, effort, imageModel, 
 
 // +cost к суточному счётчику; бросает AiError('quota') при превышении. Владелец без лимита.
 export async function checkQuota(userId, cost = 1) {
-  if (isOwner(userId)) return;
+  if (!LIMITS.enabled || isOwner(userId)) return;
   const day = new Date().toISOString().slice(0, 10);
   for (let i = 0; i < cost; i++) {
     const [row] = await db.insert(usage)
@@ -215,7 +215,7 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
       ])
     : [[], []];
 
-  const question = input.slice(0, AI_MAX_INPUT);
+  const question = LIMITS.enabled && !isOwner(userId) ? input.slice(0, AI_MAX_INPUT) : input;
   const hasImage = images.length > 0;
   const userContent = hasImage
     ? [
@@ -230,7 +230,7 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
   ];
   const tools = canImage ? [TOOL_GENERATE, ...(hasImage ? [TOOL_EDIT] : [])] : [];
 
-  const { content, call } = await complete(cfg, messages, tools, isOwner(userId));
+  const { content, call } = await complete(cfg, messages, tools, !LIMITS.enabled || isOwner(userId));
   const { text, found } = extractMemory(content);
   const answer = text || content;
   const image = imageRequest(call, hasImage);
