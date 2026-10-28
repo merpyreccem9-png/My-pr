@@ -31,6 +31,36 @@ export async function sayMarkdown(msg, md, { reply = true } = {}) {
   }
 }
 
+// Временное сообщение-статус («💭 Думаю…»): показываем на время работы и удаляем, когда функция завершилась
+// (ответом или ошибкой). Статус — украшение: если не отправился или не удалился, это не ломает основной ответ.
+export async function withStatus(msg, text, fn) {
+  let sent = null;
+  try {
+    sent = await api.sendMessage({ ...baseParams(msg, true), text });
+  } catch (e) {
+    console.warn('status not sent', e?.description ?? e);
+  }
+  const setStatus = async (next) => {
+    if (!sent) return;
+    try {
+      await api.editMessageText({ chat_id: msg.chat.id, message_id: sent.message_id, text: next });
+    } catch (e) {
+      if (!(e instanceof BotApiError)) throw e;   // «not modified» и т.п. — не страшно
+    }
+  };
+  try {
+    return await fn(setStatus);
+  } finally {
+    if (sent) {
+      try {
+        await api.deleteMessage({ chat_id: msg.chat.id, message_id: sent.message_id });
+      } catch (e) {
+        console.warn('status not deleted', e?.description ?? e);
+      }
+    }
+  }
+}
+
 export function typing(msg, action = 'typing') {
   const p = { chat_id: msg.chat.id, action };
   if (msg.is_topic_message && msg.message_thread_id) p.message_thread_id = msg.message_thread_id;

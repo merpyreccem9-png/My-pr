@@ -632,14 +632,15 @@ test('битая разметка → повтор обычным текстом
   await setupAi();
   aiReply('Ответ');
   apiCalls.length = 0;
-  // первый sendMessage падает «can't parse entities», повтор проходит
-  apiFail.set('sendMessage', { code: 400, description: "Bad Request: can't parse entities", times: 1 });
+  // два sendMessage падают «can't parse entities»: первый — «Думаю…» (статус не критичен), второй — ответ в HTML
+  apiFail.set('sendMessage', { code: 400, description: "Bad Request: can't parse entities", times: 2 });
   await send(pmsg(OWNER, 'привет'));
   const sendCalls = calls('sendMessage');
-  assert.equal(sendCalls.length, 2);
-  assert.equal(sendCalls[0].parse_mode, 'HTML');
-  assert.equal(sendCalls[1].parse_mode, undefined);
-  assert.equal(sendCalls[1].text, 'Ответ');
+  assert.equal(sendCalls.length, 3);
+  assert.equal(sendCalls[0].text, '💭 Думаю…');
+  assert.equal(sendCalls[1].parse_mode, 'HTML');
+  assert.equal(sendCalls[2].parse_mode, undefined);
+  assert.equal(sendCalls[2].text, 'Ответ');
   assert.equal(dump('history').length, 2);   // обмен сохранён
 });
 
@@ -1258,4 +1259,109 @@ test('журнал: записи старше 30 дней стираются п�
 test('/start и /help предупреждают, что запросы сохраняются', async () => {
   await send(pmsg(OLYA, '/help'));
   assert.match(lastText(), /Запросы к ИИ сохраняются/);
+});
+
+// ── Статус «Думаю…» ────────────────────────────────────────────────────────
+
+const idxOf = (pred) => apiCalls.findIndex(pred);
+const statusSent = () => apiCalls.filter((c) => c.method === 'sendMessage' && /^(💭|🎨|🎤|🖌).*…$/.test(c.params.text));
+
+test('«💭 Думаю…» появляется до ответа и удаляется после него', async () => {
+  await setupAi();
+  aiReply('Готово');
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, 'привет'));
+  const [status] = statusSent();
+  assert.equal(status.params.text, '💭 Думаю…');
+  const statusId = 5000 + apiCalls.indexOf(status) + 1;           // message_id из заглушки sendMessage
+  const del = apiCalls.find((c) => c.method === 'deleteMessage');
+  assert.equal(del.params.message_id, statusId);
+  assert.equal(del.params.chat_id, OWNER.id);
+  const answerAt = idxOf((c) => c.method === 'sendMessage' && c.params.text === 'Готово');
+  assert.ok(answerAt > apiCalls.indexOf(status) && apiCalls.indexOf(del) > answerAt);   // статус → ответ → удаление
+});
+
+test('ошибка ИИ: статус тоже удаляется, пользователь видит ошибку', async () => {
+  await setupAi();
+  mockFetch(async () => jsonResponse({ error: 'boom' }, 500));
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, 'привет'));
+  assert.equal(calls('deleteMessage').length, 1);
+  assert.match(lastText(), /Ошибка ИИ/);
+  assert.ok(idxOf((c) => c.method === 'deleteMessage') < idxOf((c) => c.method === 'sendMessage' && /Ошибка ИИ/.test(c.params.text)));
+});
+
+test('нет настройки ИИ или исчерпан лимит: статус даже не показывается', async () => {
+  apiCalls.length = 0;
+  await send(pmsg(U(8, 'Гость'), 'привет'));
+  assert.equal(statusSent().length, 0);
+  assert.equal(calls('deleteMessage').length, 0);
+});
+
+test('рисование: статус меняется на «Рисую…» и удаляется после картинки', async () => {
+  await sendKeyOnly();
+  route({
+    '/responses': () => jsonResponse(respCall('generate_image', { prompt: 'cat' })),
+    '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }),
+  });
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, 'нарисуй кота'));
+  assert.equal(statusSent().length, 1);                              // одно сообщение-статус, а не по одному на этап
+  assert.equal(calls('editMessageText').at(-1).text, '🎨 Рисую картинку…');
+  assert.equal(calls('deleteMessage').length, 1);
+  assert.ok(idxOf((c) => c.method === 'deleteMessage') > idxOf((c) => c.method === 'sendPhoto'));
+});
+
+test('/img: «Рисую…» и удаление; правка: «Правлю…»', async () => {
+  await sendKeyOnly();
+  fileBytes.set('in-photo', PNG);
+  route({
+    '/images/generations': () => jsonResponse({ data: [{ b64_json: b64(PNG) }] }),
+    '/images/edits': () => jsonResponse({ data: [{ b64_json: b64(JPG) }] }),
+  });
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, '/img закат'));
+  assert.equal(statusSent()[0].params.text, '🎨 Рисую картинку…');
+  assert.equal(calls('deleteMessage').length, 1);
+
+  await send(photoMsg(OWNER, undefined));
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, '/edit убери фон'));
+  assert.equal(calls('editMessageText').at(-1).text, '🖌 Правлю картинку…');
+  assert.equal(calls('deleteMessage').length, 1);
+});
+
+test('голосовое: один статус «Слушаю…» → «Думаю…», расшифровка и ответ остаются, статус удалён', async () => {
+  await sendKeyOnly();
+  fileBytes.set('in-voice', new Uint8Array([1, 2]));
+  route({
+    '/audio/transcriptions': () => jsonResponse({ text: 'привет' }),
+    '/responses': () => jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Отлично!' }] }] }),
+  });
+  apiCalls.length = 0;
+  await send(voiceMsg(OWNER));
+  assert.deepEqual(statusSent().map((c) => c.params.text), ['🎤 Слушаю…']);
+  assert.equal(calls('editMessageText').at(-1).text, '💭 Думаю…');
+  assert.equal(calls('deleteMessage').length, 1);
+  assert.deepEqual(calls('sendMessage').map((m) => m.text).slice(-2), ['🎤 <i>привет</i>', 'Отлично!']);
+});
+
+test('группа: /ai показывает «Думаю…» реплаем и удаляет после ответа', async () => {
+  await sendKeyOnly();
+  aiReply('Ответ в группе');
+  apiCalls.length = 0;
+  await send(gmsg('/ai привет'));
+  const [status] = statusSent();
+  assert.equal(status.params.text, '💭 Думаю…');
+  assert.ok(status.params.reply_parameters);
+  assert.equal(calls('deleteMessage').length, 1);
+  assert.equal(lastText(), 'Ответ в группе');
+});
+
+test('статус не критичен: удалить не вышло — ответ всё равно доставлен', async () => {
+  await setupAi();
+  aiReply('Ответ дошёл');
+  apiFail.set('deleteMessage', { code: 400, description: 'Bad Request: message to delete not found' });
+  await send(pmsg(OWNER, 'привет'));
+  assert.equal(lastText(), 'Ответ дошёл');
 });

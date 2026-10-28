@@ -4,7 +4,7 @@ import { api, db } from 'sdk';
 import { users, chats, history } from '../schema.js';
 import { esc, maskKey } from './fmt.js';
 import { splitCommand, parseGender } from './parse.js';
-import { say, sayMarkdown, typing } from './tg.js';
+import { say, sayMarkdown, typing, withStatus } from './tg.js';
 import { touchUser, patchUser, botUsername, kvGetMany, kvSet } from './store.js';
 import {
   AiError, askAi, checkQuota, getAiConfig, setAiConfig, normEffort, addFact, forgetFact, clearHistory,
@@ -52,49 +52,63 @@ async function recentImage(user) {
 
 const rememberImage = (userId, fileId) => kvSet(imgKey(userId), fileId ? `${fileId}|${nowSec()}` : '');
 
-// opts.imageId — картинка, присланная прямо сейчас; opts.skipQuota — лимит уже списан (голосовые).
-export async function chat(msg, user, input, { imageId = null, skipQuota = false, kind = 'text' } = {}) {
+// Статус «💭 Думаю…» на время работы: на xhigh модель думает долго, и без него кажется, что бот завис.
+// Сообщение удаляется, когда ответ отправлен (или произошла ошибка). Голосовые передают свой статус дальше.
+const inStatus = async (msg, existing, text, fn) => {
+  if (!existing) return withStatus(msg, text, fn);
+  await existing(text);
+  return fn(existing);
+};
+
+// opts.imageId — картинка, присланная прямо сейчас; opts.skipQuota — лимит уже списан (голосовые);
+// opts.status — уже показанный статус (setStatus из withStatus).
+export async function chat(msg, user, input, { imageId = null, skipQuota = false, kind = 'text', status = null } = {}) {
   try {
     if (!skipQuota) await checkQuota(user.tgId);
-    typing(msg);
+    if (!(await getAiConfig())) throw new AiError('not_configured');   // не мигаем статусом перед ошибкой
+    await inStatus(msg, status, '💭 Думаю…', async (setStatus) => {
+      typing(msg);
 
-    // Картинка: присланная сейчас или недавно (для «добавь шляпу» отдельным сообщением).
-    let src = null;
-    if (imageId) src = await loadImage(imageId);
-    else {
-      const recent = await recentImage(user);
-      if (recent) src = await loadImage(recent).catch(() => null);   // file_id мог протухнуть — не страшно
-    }
+      // Картинка: присланная сейчас или недавно (для «добавь шляпу» отдельным сообщением).
+      let src = null;
+      if (imageId) src = await loadImage(imageId);
+      else {
+        const recent = await recentImage(user);
+        if (recent) src = await loadImage(recent).catch(() => null);   // file_id мог протухнуть — не страшно
+      }
 
-    const out = await askAi({
-      userId: user.tgId, name: user.name, persona: user.persona, input, useMemory: user.aiMemory !== false,
-      images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true,
+      const out = await askAi({
+        userId: user.tgId, name: user.name, persona: user.persona, input, useMemory: user.aiMemory !== false,
+        images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true,
+      });
+      await logAi({ from: msg.from, kind, input, model: out.model, usage: out.usage });   // токены уже потрачены
+      if (out.image) {
+        if (out.text) await sayMarkdown(msg, out.text, { reply: false });
+        await produceImage(msg, user, out.image, src, { setStatus });
+      } else {
+        await sayMarkdown(msg, out.text, { reply: false });
+      }
+      await out.commit();
     });
-    await logAi({ from: msg.from, kind, input, model: out.model, usage: out.usage });   // токены уже потрачены
-    if (out.image) {
-      if (out.text) await sayMarkdown(msg, out.text, { reply: false });
-      await produceImage(msg, user, out.image, src);
-    } else {
-      await sayMarkdown(msg, out.text, { reply: false });
-    }
-    await out.commit();
   } catch (e) {
     await aiFailure(msg, user, e);
   }
 }
 
 // Рисует/правит картинку и отправляет её. Картинка стоит AI_IMAGE_QUOTA_COST запросов (1 уже списан за текст).
-async function produceImage(msg, user, req, src, { charged = 1 } = {}) {
+async function produceImage(msg, user, req, src, { charged = 1, setStatus = null } = {}) {
   await checkQuota(user.tgId, Math.max(0, AI_IMAGE_QUOTA_COST - charged));
   const cfg = await getAiConfig();
   if (!cfg) throw new AiError('not_configured');
+  const editing = req.kind === 'edit' && src;
+  await setStatus?.(editing ? '🖌 Правлю картинку…' : '🎨 Рисую картинку…');
   typing(msg, 'upload_photo');
-  const result = req.kind === 'edit' && src
+  const result = editing
     ? await editImage(cfg, src, req.prompt)
     : await generateImage(cfg, req.prompt, req.size);
   const fileId = await sendImage(msg, result);
   await rememberImage(user.tgId, fileId);
-  await logAi({ from: msg.from, kind: req.kind === 'edit' && src ? 'img-edit' : 'img-gen', input: req.prompt, model: cfg.imageModel });
+  await logAi({ from: msg.from, kind: editing ? 'img-edit' : 'img-gen', input: req.prompt, model: cfg.imageModel });
 }
 
 // ── Картинка от пользователя ─────────────────────────────────────────────
@@ -120,12 +134,14 @@ async function handleAudio(msg, user, media) {
     await checkQuota(user.tgId);
     const cfg = await getAiConfig();
     if (!cfg) throw new AiError('not_configured');
-    typing(msg);
-    const bytes = await downloadFile(media.fileId, media.size);
-    const text = await transcribe(cfg, bytes, { filename: media.name, type: media.mime });
-    if (!text) return void (await say(msg, '🎤 Не удалось разобрать речь. Попробуйте записать ещё раз.'));
-    await say(msg, `🎤 <i>${esc(text.slice(0, 1000))}</i>`, { reply: false });
-    return await chat(msg, user, text, { skipQuota: true, kind: 'voice' });
+    await withStatus(msg, '🎤 Слушаю…', async (setStatus) => {
+      typing(msg);
+      const bytes = await downloadFile(media.fileId, media.size);
+      const text = await transcribe(cfg, bytes, { filename: media.name, type: media.mime });
+      if (!text) return void (await say(msg, '🎤 Не удалось разобрать речь. Попробуйте записать ещё раз.'));
+      await say(msg, `🎤 <i>${esc(text.slice(0, 1000))}</i>`, { reply: false });
+      await chat(msg, user, text, { skipQuota: true, kind: 'voice', status: setStatus });
+    });
   } catch (e) {
     await aiFailure(msg, user, e);
   }
@@ -263,7 +279,8 @@ async function imageCommand(msg, user, req) {
   try {
     await checkQuota(user.tgId, AI_IMAGE_QUOTA_COST);
     const src = req.kind === 'edit' ? await loadImage(await recentImage(user)) : null;
-    await produceImage(msg, user, req, src, { charged: AI_IMAGE_QUOTA_COST });
+    await withStatus(msg, '🎨 Рисую картинку…', (setStatus) =>
+      produceImage(msg, user, req, src, { charged: AI_IMAGE_QUOTA_COST, setStatus }));
   } catch (e) {
     await aiFailure(msg, user, e);
   }

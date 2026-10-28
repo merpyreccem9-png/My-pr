@@ -5,7 +5,7 @@ import { api } from 'sdk';
 import { esc, mention } from './fmt.js';
 import { splitCommand, parseGender } from './parse.js';
 import { RP_BY_WORD, renderRp } from './rp.js';
-import { say, sayMarkdown, typing, fail } from './tg.js';
+import { say, sayMarkdown, typing, fail, withStatus } from './tg.js';
 import { touchUser, patchUser, getChat, setChat, botUsername } from './store.js';
 import { isAdminMsg } from './admin.js';
 import { actorOf } from './actor.js';
@@ -194,9 +194,11 @@ async function groupAi(msg, cmd) {
   try {
     await checkQuota(msg.from.id);
     typing(msg);
-    const out = await askAi({ userId: msg.from.id, name: user.name, persona: user.persona, input: question, useMemory: false });
-    await logAi({ from: msg.from, kind: 'group', input: question, model: out.model, usage: out.usage });
-    await sayMarkdown(msg, out.text);
+    await withStatus(msg, '💭 Думаю…', async () => {
+      const out = await askAi({ userId: msg.from.id, name: user.name, persona: user.persona, input: question, useMemory: false });
+      await logAi({ from: msg.from, kind: 'group', input: question, model: out.model, usage: out.usage });
+      await sayMarkdown(msg, out.text);
+    });
   } catch (e) {
     if (e instanceof AiError) return void (await aiFailure(msg, user, e));
     throw e;
