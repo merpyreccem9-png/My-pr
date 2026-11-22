@@ -1485,3 +1485,117 @@ test('стриминг: длинный ответ делится на сообщ
   assert.ok(!shown.at(-1).text.endsWith('▍'));            // финальная правка — без курсора
   assert.ok(shown.some((e) => !e.parse_mode));            // одна правка ушла без parse_mode (запасной путь)
 });
+
+// ── Кнопки под ответом, глубина мышления, умная память ─────────────────────
+
+const kvOf = (key) => dump('kv').find((r) => r.key === key)?.value;
+const lastBody = () => JSON.parse(fetchCalls.at(-1).init.body);
+const userTextOf = (body) => {
+  const m = (body.input ?? body.messages).at(-1).content;
+  return typeof m === 'string' ? m : m.map((p) => p.text ?? '').join('');
+};
+
+test('кнопки под ответом ИИ: Заново / Короче / Подробнее', async () => {
+  await setupAi();
+  aiReply('Готово');
+  await send(pmsg(OWNER, 'расскажи про Луну'));
+  const kb = calls('sendMessage').at(-1).reply_markup.inline_keyboard[0];
+  assert.deepEqual(kb.map((k) => k.callback_data), ['r:again', 'r:short', 'r:long']);
+  assert.equal(JSON.parse(kvOf(`last.${OWNER.id}`)).q, 'расскажи про Луну');
+});
+
+test('«➕ Подробнее»: тот же вопрос + промпт «подробнее», effort не ниже high, обмен в памяти заменён', async () => {
+  await sendKeyOnly();
+  aiReply('Коротко');
+  await send(pmsg(OWNER, 'что такое Луна'));
+  await callbackHandler(pcb(OWNER, 'd:fast'));                        // пользователь выбрал «Быстро» (low)
+  aiReply('Очень подробный ответ');
+  await callbackHandler(pcb(OWNER, 'r:long'));
+
+  const body = lastBody();
+  assert.match(userTextOf(body), /^что такое Луна\n\n\[Ответь подробнее/);
+  assert.equal(body.reasoning.effort, 'high');
+  assert.deepEqual(dump('history').map((h) => h.content), ['что такое Луна', 'Очень подробный ответ']);   // без дублей, без подсказки
+  assert.equal(calls('editMessageReplyMarkup').at(-1).reply_markup.inline_keyboard.length, 0);   // кнопки у старого сообщения убраны
+  assert.equal(calls('sendMessage').at(-1).text, 'Очень подробный ответ');
+});
+
+test('«✂️ Короче»: легче effort и быстрая модель, если задана (/setfast)', async () => {
+  await sendKeyOnly();
+  await send(pmsg(OWNER, '/setfast gpt-6-luna-mini'));
+  aiReply('Длинный ответ');
+  await send(pmsg(OWNER, 'объясни квантовую механику'));
+  assert.equal(lastBody().model, 'gpt-6-luna');
+  aiReply('Коротко');
+  await callbackHandler(pcb(OWNER, 'r:short'));
+
+  const body = lastBody();
+  assert.equal(body.model, 'gpt-6-luna-mini');
+  assert.equal(body.reasoning.effort, 'low');
+  assert.match(userTextOf(body), /\[Ответь максимально кратко/);
+  assert.deepEqual(dump('history').map((h) => h.content), ['объясни квантовую механику', 'Коротко']);
+});
+
+test('«🔄 Заново»: тот же вопрос без подсказки; нет прошлого вопроса — понятный тост', async () => {
+  await sendKeyOnly();
+  await callbackHandler(pcb(OWNER, 'r:again'));
+  assert.equal(fetchCalls.length, 0);
+  assert.equal(calls('answerCallbackQuery').at(-1).show_alert, true);
+
+  aiReply('Первый');
+  await send(pmsg(OWNER, 'вопрос'));
+  aiReply('Второй');
+  await callbackHandler(pcb(OWNER, 'r:again'));
+  assert.equal(userTextOf(lastBody()), 'вопрос');
+  assert.deepEqual(dump('history').map((h) => h.content), ['вопрос', 'Второй']);
+});
+
+test('глубина мышления: пользователь выбирает, влияет на effort; /depth открывает экран', async () => {
+  await sendKeyOnly();
+  await send(pmsg(OWNER, '/depth'));
+  assert.match(lastText(), /Глубина мышления/);
+  await callbackHandler(pcb(OWNER, 'd:fast'));
+  assert.match(calls('editMessageText').at(-1).text, /Сейчас: <b>⚡ Быстро<\/b>/);
+  aiReply('ок');
+  await send(pmsg(OWNER, 'привет'));
+  assert.equal(lastBody().reasoning.effort, 'low');
+  await callbackHandler(pcb(OWNER, 'd:auto'));
+  aiReply('ок');
+  await send(pmsg(OWNER, 'ещё'));
+  assert.equal(lastBody().reasoning.effort, 'xhigh');      // авто = настройка владельца
+});
+
+test('умная память: вышедшие из окна реплики сжимаются в сводку, сводка уходит в системный промпт, /new её сбрасывает', async () => {
+  await setupAi();
+  await send(pmsg(OWNER, '/start'));
+  for (let i = 1; i <= 24; i++) {
+    await db.insert(history).values({ userId: OWNER.id, role: i % 2 ? 'user' : 'assistant', content: `реплика ${i} ${'слово '.repeat(90)}` });
+  }
+  let n = 0;
+  mockFetch(async () => jsonResponse({ choices: [{ message: { content: n++ === 0 ? 'ответ' : '- любит астрономию, готовится к IELTS' } }] }));
+  await send(pmsg(OWNER, 'новое'));
+
+  assert.equal(fetchCalls.length, 2);                      // ответ + сжатие в сводку
+  const sumReq = JSON.parse(fetchCalls[1].init.body).messages;
+  assert.match(sumReq[0].content, /сжимаешь историю/);
+  assert.match(sumReq[1].content, /реплика 1 /);
+  assert.equal(kvOf(`sum.${OWNER.id}`), '- любит астрономию, готовится к IELTS');
+  assert.equal(kvOf(`pend.${OWNER.id}`), '');
+
+  aiReply('ок');
+  await send(pmsg(OWNER, 'ещё'));
+  assert.match(JSON.parse(fetchCalls.at(-1).init.body).messages[0].content, /сводка прошлых разговоров[\s\S]*любит астрономию/);
+
+  await send(pmsg(OWNER, '/new'));
+  assert.equal(kvOf(`sum.${OWNER.id}`), '');
+});
+
+test('умная память: пока вышедшего мало, лишних запросов к модели нет — реплики копятся в очереди', async () => {
+  await setupAi();
+  aiReply('ок');
+  await send(pmsg(OWNER, '/start'));
+  for (let i = 1; i <= 20; i++) await db.insert(history).values({ userId: OWNER.id, role: i % 2 ? 'user' : 'assistant', content: `m${i}` });
+  await send(pmsg(OWNER, 'новое'));
+  assert.equal(fetchCalls.length, 1);
+  assert.match(kvOf(`pend.${OWNER.id}`), /Пользователь: m1/);
+});

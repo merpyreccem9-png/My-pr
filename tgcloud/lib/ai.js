@@ -57,8 +57,29 @@ export function normEffort(v) {
   return EFFORTS.includes(e) ? e : null;
 }
 
+// Глубина мышления — выбор пользователя (хранится в kv, миграция базы не нужна). auto — как настроил владелец.
+export const DEPTHS = {
+  auto:   ['🤖 Авто', null],
+  fast:   ['⚡ Быстро', 'low'],
+  normal: ['⚖️ Обычно', 'medium'],
+  deep:   ['🧠 Глубоко', 'xhigh'],
+};
+const depthKey = (id) => `depth.${id}`;
+const sumKey = (id) => `sum.${id}`;     // сводка давних разговоров
+const pendKey = (id) => `pend.${id}`;   // реплики, вышедшие из окна, но ещё не вошедшие в сводку
+export const lastKey = (id) => `last.${id}`;   // последний вопрос — для кнопок «Заново / Короче / Подробнее»
+
+export async function getDepth(userId) {
+  const v = (await kvGetMany([depthKey(userId)]))[depthKey(userId)];
+  return DEPTHS[v] ? v : 'auto';
+}
+export const setDepth = (userId, key) => kvSet(depthKey(userId), key);
+
+const SHORT_HINT = 'Ответь максимально кратко: 2–4 предложения, только суть, без вступлений и повторов.';
+const LONG_HINT = 'Ответь подробнее и развёрнуто: шаги, примеры, нюансы, пояснения терминов. Ограничение на компактность здесь снято.';
+
 export async function getAiConfig() {
-  const c = await kvGetMany(['ai.base_url', 'ai.api_key', 'ai.model', 'ai.effort', 'ai.image_model', 'ai.stt_model']);
+  const c = await kvGetMany(['ai.base_url', 'ai.api_key', 'ai.model', 'ai.effort', 'ai.image_model', 'ai.stt_model', 'ai.fast_model']);
   if (!c['ai.api_key']) return null;
   return {
     baseUrl: c['ai.base_url'] || AI_DEFAULT_BASE_URL,
@@ -67,16 +88,18 @@ export async function getAiConfig() {
     effort: normEffort(c['ai.effort'] === undefined || c['ai.effort'] === null ? AI_DEFAULT_EFFORT : c['ai.effort']),
     imageModel: c['ai.image_model'] || AI_IMAGE_MODEL,
     sttModel: c['ai.stt_model'] || AI_STT_MODEL,
+    fastModel: c['ai.fast_model'] || null,    // «Короче» и сводки памяти: более лёгкая модель (если не задана — основная)
   };
 }
 
-export async function setAiConfig({ baseUrl, model, apiKey, effort, imageModel, sttModel }) {
+export async function setAiConfig({ baseUrl, model, apiKey, effort, imageModel, sttModel, fastModel }) {
   if (baseUrl) await kvSet('ai.base_url', baseUrl.replace(/\/+$/, '').replace(/\/chat\/completions$/, ''));
   if (model) await kvSet('ai.model', model);
   if (apiKey) await kvSet('ai.api_key', apiKey);
   if (effort !== undefined) await kvSet('ai.effort', effort);          // 'off' — не отправлять
   if (imageModel) await kvSet('ai.image_model', imageModel);
   if (sttModel) await kvSet('ai.stt_model', sttModel);
+  if (fastModel) await kvSet('ai.fast_model', fastModel === 'off' ? '' : fastModel);
 }
 
 // +cost к суточному счётчику; бросает AiError('quota') при превышении. Владелец без лимита.
@@ -354,12 +377,13 @@ function imageRequest(call, canEdit) {
   return { kind, prompt, size };
 }
 
-export function buildSystemPrompt({ name, persona, facts: factList, canImage = false }) {
+export function buildSystemPrompt({ name, persona, facts: factList, canImage = false, summary = '' }) {
   const parts = [BASE_PROMPT];
   if (canImage) parts.push(IMAGE_PROMPT);
   if (persona) parts.push(`Стиль общения: ${persona}`);
   if (name) parts.push(`Собеседника зовут ${name}.`);
   if (factList.length) parts.push(`Что известно о собеседнике:\n${factList.map((f) => `- ${f}`).join('\n')}`);
+  if (summary) parts.push(`Краткая сводка прошлых разговоров (контекст, не пересказывай её):\n${summary}`);
   return parts.join('\n\n');
 }
 
@@ -375,16 +399,59 @@ const partialClean = (raw) => deLatex(
   raw.replace(REMEMBER_RE, '').replace(/\[\[?(?:r[a-z]*:?[^\]]*)?$/i, ''),
 ).trim();
 
+// ── Умная память: реплики, вышедшие из окна, не пропадают, а сжимаются в сводку ──────────
+const SUMMARY_AFTER = 2500;   // сколько символов «вышедших» реплик копим, прежде чем сжимать (редкий запрос, а не каждый раз)
+const SUMMARY_PROMPT = [
+  'Ты сжимаешь историю диалога в краткую сводку для долговременного контекста.',
+  'Объедини прежнюю сводку и новые реплики: оставь факты о собеседнике, договорённости, принятые решения, незавершённые задачи и темы.',
+  'Не включай пустую болтовню, приветствия и пароли/документы/платёжные данные. Пиши по-русски, до 1200 символов, списком через «-».',
+].join(' ');
+
+async function foldIntoSummary(cfg, userId, stored, rows) {
+  const lines = rows.map((r) => `${r.role === 'user' ? 'Пользователь' : 'Ассистент'}: ${r.content.slice(0, 500)}`).join('\n');
+  const pending = `${stored[pendKey(userId)] ?? ''}\n${lines}`.trim().slice(-8000);
+  if (pending.length < SUMMARY_AFTER) return void (await kvSet(pendKey(userId), pending));
+  try {
+    const { content } = await completeChat(
+      { ...cfg, model: cfg.fastModel || cfg.model, effort: cfg.effort ? 'low' : null },
+      [
+        { role: 'system', content: SUMMARY_PROMPT },
+        { role: 'user', content: `Прежняя сводка:\n${stored[sumKey(userId)] || '—'}\n\nНовые реплики:\n${pending}` },
+      ],
+      [],
+    );
+    await Promise.all([kvSet(sumKey(userId), content.slice(0, 1500)), kvSet(pendKey(userId), '')]);
+  } catch (e) {
+    console.warn('summary failed', e?.code ?? e);   // не страшно: реплики остаются в очереди до следующей попытки
+    await kvSet(pendKey(userId), pending);
+  }
+}
+
 /**
  * Задать вопрос модели.
  * images — data-URL картинок (модель их «видит»); canImage — разрешить рисование/правку через функции.
+ * mode — 'short' (легче модель/effort, «ответь кратко») | 'long' (effort не ниже high, «ответь подробнее»);
+ *   подсказка уходит модели, а в историю пишется исходный вопрос. replaceLast — заменить последний обмен (кнопки «Заново/Короче/Подробнее»).
  * onText(текст) — необязательный колбэк: включает потоковый режим и получает ответ по мере генерации (уже очищенный).
  * @returns {{ text: string, image: ?{kind,prompt,size}, commit: () => Promise<void> }}
  *   commit() сохраняет память — вызывайте ПОСЛЕ отправки ответа.
  */
-export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false, onText = null }) {
-  const cfg = await getAiConfig();
-  if (!cfg) throw new AiError('not_configured');
+export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false, onText = null, mode = null, replaceLast = false }) {
+  const base = await getAiConfig();
+  if (!base) throw new AiError('not_configured');
+
+  const stored = await kvGetMany([depthKey(userId), sumKey(userId), pendKey(userId)]);
+  const depthEffort = DEPTHS[stored[depthKey(userId)]]?.[1] ?? null;
+  let effort = base.effort && depthEffort ? depthEffort : base.effort;   // «Глубина» — только если модель вообще с рассуждением
+  let hint = '';
+  if (mode === 'short') {
+    if (effort && effort !== 'none') effort = 'low';
+    hint = SHORT_HINT;
+  } else if (mode === 'long') {
+    if (effort && EFFORTS.indexOf(effort) < EFFORTS.indexOf('high')) effort = 'high';
+    hint = LONG_HINT;
+  }
+  const cfg = { ...base, effort, model: mode === 'short' ? (base.fastModel || base.model) : base.model };
 
   const [hist, factRows] = useMemory
     ? await Promise.all([
@@ -393,16 +460,20 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
       ])
     : [[], []];
 
+  // Заново/Короче/Подробнее: прошлый обмен (вопрос + ответ) заменяем новым, а не копим дубли.
+  const replaced = replaceLast && hist.length >= 2 && hist[0].role === 'assistant' && hist[1].role === 'user' ? hist.splice(0, 2) : [];
+
   const question = LIMITS.enabled && !isOwner(userId) ? input.slice(0, AI_MAX_INPUT) : input;
+  const asked = hint ? `${question}\n\n[${hint}]` : question;   // подсказку видит модель, в историю она не попадает
   const hasImage = images.length > 0;
   const userContent = hasImage
     ? [
-        { type: 'text', text: question || 'Посмотри на картинку.' },
+        { type: 'text', text: asked || 'Посмотри на картинку.' },
         { type: 'image_url', image_url: { url: images[0] } },
       ]
-    : question;
+    : asked;
   const messages = [
-    { role: 'system', content: buildSystemPrompt({ name, persona, facts: factRows.map((f) => f.body), canImage }) },
+    { role: 'system', content: buildSystemPrompt({ name, persona, facts: factRows.map((f) => f.body), canImage, summary: useMemory ? stored[sumKey(userId)] ?? '' : '' }) },
     ...hist.slice().reverse().map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userContent },
   ];
@@ -427,6 +498,7 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
 
   const commit = async () => {
     if (!useMemory) return;
+    if (replaced.length) await db.delete(history).where(inArray(history.id, replaced.map((r) => r.id))).run();
     const said = [answer, image ? `[${image.kind === 'edit' ? 'изменил' : 'нарисовал'} картинку: ${image.prompt.slice(0, 200)}]` : '']
       .filter(Boolean).join('\n');
     await db.insert(history).values([
@@ -436,7 +508,12 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
     // Обрезаем хвост: оставляем только то, что вошло в окно контекста.
     if (hist.length >= AI_HISTORY) {
       const oldestKept = hist[hist.length - 1].id;
-      await db.delete(history).where(and(eq(history.userId, userId), lt(history.id, oldestKept))).run();
+      const old = await db.select().from(history)
+        .where(and(eq(history.userId, userId), lt(history.id, oldestKept))).orderBy(asc(history.id)).all();
+      if (old.length) {
+        await db.delete(history).where(and(eq(history.userId, userId), lt(history.id, oldestKept))).run();
+        await foldIntoSummary(cfg, userId, stored, old);   // вышедшее из окна не теряется, а уходит в сводку
+      }
     }
     for (const f of found.slice(0, 1)) await addFact(userId, f, factRows);
   };
@@ -472,4 +549,7 @@ export async function forgetFact(userId, n) {
 }
 
 export const clearFacts = (userId) => db.delete(facts).where(eq(facts.userId, userId)).run();
-export const clearHistory = (userId) => db.delete(history).where(eq(history.userId, userId)).run();
+export const clearHistory = async (userId) => {
+  await db.delete(history).where(eq(history.userId, userId)).run();
+  await Promise.all([kvSet(sumKey(userId), ''), kvSet(pendKey(userId), '')]);   // сводка — часть диалога, сбрасывается с ним
+};

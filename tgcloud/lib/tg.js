@@ -19,14 +19,16 @@ export function say(msg, html, { reply = true, ...extra } = {}) {
 }
 
 // Ответ ИИ: markdown → HTML, длинное режется на части; при ошибке разметки уходит обычным текстом.
-export async function sayMarkdown(msg, md, { reply = true } = {}) {
+export async function sayMarkdown(msg, md, { reply = true, markup } = {}) {
   const base = baseParams(msg, reply);
-  for (const part of chunk(md)) {
+  const parts = chunk(md);
+  for (const [i, part] of parts.entries()) {
+    const kb = markup && i === parts.length - 1 ? { reply_markup: markup } : {};   // кнопки — под последней частью
     try {
-      await api.sendMessage({ ...base, text: mdToHtml(part), parse_mode: 'HTML' });
+      await api.sendMessage({ ...base, ...kb, text: mdToHtml(part), parse_mode: 'HTML' });
     } catch (e) {
       if (!(e instanceof BotApiError) || e.code !== 400) throw e;
-      await api.sendMessage({ ...base, text: part });
+      await api.sendMessage({ ...base, ...kb, text: part });
     }
     delete base.reply_parameters; // реплаем только первая часть
   }
@@ -47,23 +49,24 @@ export function streamReply(msg, { reply = false, interval = AI_STREAM_INTERVAL_
   let backoffUntil = 0;
   let closed = false;
 
-  async function put(i, md, cursor, strict = false) {
+  async function put(i, md, cursor, strict = false, markup = null) {
     const tail = cursor ? CURSOR : '';
     const html = mdToHtml(md) + tail;
+    const key = markup ? `${html}\u0000kb` : html;   // кнопки тоже часть вида: добавились — нужна правка
     const slot = sent[i];
-    if (slot && slot.shown === html) return;
+    if (slot && slot.shown === key) return;
     const attempt = async (asHtml) => {
       const text = asHtml ? html : md + tail;
-      const extra = asHtml ? { parse_mode: 'HTML' } : {};
+      const extra = { ...(asHtml ? { parse_mode: 'HTML' } : {}), ...(markup ? { reply_markup: markup } : {}) };
       if (!slot) {
         const m = await api.sendMessage({ ...base, ...extra, text });
         delete base.reply_parameters;
-        sent[i] = { id: m.message_id, shown: html };
+        sent[i] = { id: m.message_id, shown: key };
       } else {
         await api.editMessageText({
           chat_id: msg.chat.id, message_id: slot.id, link_preview_options: { is_disabled: true }, ...extra, text,
         });
-        slot.shown = html;
+        slot.shown = key;
       }
     };
     try {
@@ -75,21 +78,24 @@ export function streamReply(msg, { reply = false, interval = AI_STREAM_INTERVAL_
       }
     } catch (e) {
       if (!(e instanceof BotApiError)) throw e;
-      if (notModified(e)) { if (slot) slot.shown = html; return; }
+      if (notModified(e)) { if (slot) slot.shown = key; return; }
       if (e.code === 429) backoffUntil = Date.now() + (Number(e.parameters?.retry_after) || 3) * 1000;
       console.warn('stream put failed', e.code, e.description);
       if (!strict) return;
       if (!slot) throw e;
       // Итог обязан дойти: правка не удалась — присылаем часть новым сообщением.
-      const m = await api.sendMessage({ ...base, text: md });
+      const m = await api.sendMessage({ ...base, ...(markup ? { reply_markup: markup } : {}), text: md });
       await quiet(api.deleteMessage({ chat_id: msg.chat.id, message_id: slot.id }));
-      sent[i] = { id: m.message_id, shown: html };
+      sent[i] = { id: m.message_id, shown: key };
     }
   }
 
-  async function flush(text, cursor, strict = false) {
+  async function flush(text, cursor, strict = false, markup = null) {
     const parts = chunk(text);
-    for (let i = 0; i < parts.length; i++) await put(i, parts[i], cursor && i === parts.length - 1, strict);
+    for (let i = 0; i < parts.length; i++) {
+      const last = i === parts.length - 1;
+      await put(i, parts[i], cursor && last, strict, last ? markup : null);
+    }
     return parts.length;
   }
 
@@ -102,14 +108,14 @@ export function streamReply(msg, { reply = false, interval = AI_STREAM_INTERVAL_
       await flush(text, true);
     },
 
-    async finish(text) {
+    async finish(text, { markup = null } = {}) {
       closed = true;
       const final = String(text ?? '').trim();
       if (!sent.length) {
-        if (final) await sayMarkdown(msg, final, { reply });
+        if (final) await sayMarkdown(msg, final, { reply, markup });
         return;
       }
-      const n = final ? await flush(final, false, true) : 0;
+      const n = final ? await flush(final, false, true, markup) : 0;
       for (const s of sent.splice(n)) await quiet(api.deleteMessage({ chat_id: msg.chat.id, message_id: s.id }));
     },
 

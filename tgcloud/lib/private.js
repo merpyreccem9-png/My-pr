@@ -7,13 +7,13 @@ import { splitCommand, parseGender } from './parse.js';
 import { say, sayMarkdown, streamReply, typing, withStatus } from './tg.js';
 import { touchUser, patchUser, botUsername, kvGetMany, kvSet } from './store.js';
 import {
-  AiError, askAi, checkQuota, getAiConfig, setAiConfig, normEffort, addFact, forgetFact, clearHistory,
+  AiError, askAi, checkQuota, getAiConfig, setAiConfig, normEffort, addFact, forgetFact, clearHistory, lastKey,
 } from './ai.js';
 import { logAi, statsText, logText, userText } from './stats.js';
 import {
   pickMedia, loadImage, downloadFile, toDataUrl, transcribe, generateImage, editImage, sendImage,
 } from './media.js';
-import { homeScreen, helpScreen, rpList, personaScreen, memScreen } from './menu.js';
+import { homeScreen, helpScreen, rpList, personaScreen, memScreen, depthScreen, answerKb } from './menu.js';
 import { isOwner, AI_IMAGE_QUOTA_COST, AI_IMAGE_TTL, AI_MAX_AUDIO_SEC, AI_STREAM } from './config.js';
 
 export async function handlePrivate(msg) {
@@ -62,7 +62,8 @@ const inStatus = async (msg, existing, text, fn) => {
 
 // opts.imageId — картинка, присланная прямо сейчас; opts.skipQuota — лимит уже списан (голосовые);
 // opts.status — уже показанный статус (setStatus из withStatus).
-export async function chat(msg, user, input, { imageId = null, skipQuota = false, kind = 'text', status = null } = {}) {
+// opts.mode — 'short' | 'long' (кнопки «Короче»/«Подробнее»), opts.replace — заменить последний обмен в памяти (кнопки под ответом).
+export async function chat(msg, user, input, { imageId = null, skipQuota = false, kind = 'text', status = null, mode = null, replace = false } = {}) {
   const stream = streamReply(msg, { reply: false });   // ответ печатается на глазах: сообщение дописывается по ходу генерации
   try {
     if (!skipQuota) await checkQuota(user.tgId);
@@ -88,11 +89,13 @@ export async function chat(msg, user, input, { imageId = null, skipQuota = false
 
       const out = await askAi({
         userId: user.tgId, name: user.name, persona: user.persona, input, useMemory: user.aiMemory !== false,
-        images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true, onText,
+        images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true, onText, mode, replaceLast: replace,
       });
       await logAi({ from: msg.from, kind, input, model: out.model, usage: out.usage });   // токены уже потрачены
-      await stream.finish(out.text);   // финальная версия: убирает курсор, досылает хвост длинного ответа
+      // Финальная версия: убирает курсор, досылает хвост длинного ответа; под текстом — кнопки «Заново / Короче / Подробнее».
+      await stream.finish(out.text, { markup: out.image ? null : answerKb() });
       if (out.image) await produceImage(msg, user, out.image, src, { setStatus });
+      else if (out.text) await kvSet(lastKey(user.tgId), JSON.stringify({ q: input.slice(0, 4000) }));
       await out.commit();
     });
   } catch (e) {
@@ -224,6 +227,11 @@ async function runCommand(msg, user, cmd) {
     case 'cancel':
       await patchUser(user.tgId, { awaiting: null });
       return void (await say(msg, 'Отменено.'));
+    case 'depth':
+    case 'глубина': {
+      const s = await depthScreen(user);
+      return void (await say(msg, s.text, { reply_markup: s.kb }));
+    }
     case 'memory': {
       const s = await memScreen(user);
       return void (await say(msg, s.text, { reply_markup: s.kb }));
@@ -340,6 +348,15 @@ async function ownerCommand(msg, user, cmd) {
       await say(msg, `✅ Effort: <code>${e}</code>`);
       return true;
     }
+    case 'setfast': {
+      if (!cmd.args.trim()) {
+        await say(msg, 'Использование: <code>/setfast модель</code> — лёгкая модель для «✂️ Короче» и сводок памяти. <code>/setfast off</code> — вернуть основную.');
+        return true;
+      }
+      await setAiConfig({ fastModel: cmd.args.trim() });
+      await say(msg, '✅ Быстрая модель сохранена.');
+      return true;
+    }
     case 'setimage': {
       if (!cmd.args.trim()) { await say(msg, 'Использование: <code>/setimage gpt-image-2</code>'); return true; }
       await setAiConfig({ imageModel: cmd.args.trim() });
@@ -356,7 +373,7 @@ async function ownerCommand(msg, user, cmd) {
       const cfg = await getAiConfig();
       await say(msg, cfg
         ? `🤖 ИИ подключён\nURL: <code>${esc(cfg.baseUrl)}</code>\nМодель: <code>${esc(cfg.model)}</code>\nEffort: <code>${cfg.effort ?? 'выкл'}</code>\n` +
-          `Картинки: <code>${esc(cfg.imageModel)}</code>\nГолос: <code>${esc(cfg.sttModel)}</code>\nКлюч: <code>${esc(maskKey(cfg.apiKey))}</code>`
+          `Быстрая: <code>${esc(cfg.fastModel ?? 'как основная')}</code>\nКартинки: <code>${esc(cfg.imageModel)}</code>\nГолос: <code>${esc(cfg.sttModel)}</code>\nКлюч: <code>${esc(maskKey(cfg.apiKey))}</code>`
         : '🤖 ИИ не настроен: нужен /setkey.');
       return true;
     }
