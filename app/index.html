@@ -11,12 +11,22 @@
 <body>
   <div id="app">
     <header class="top">
-      <button id="depthBtn" class="pill" aria-label="Глубина мышления"></button>
-      <div class="title">Luna</div>
+      <div class="avatar">🌙</div>
+      <div class="who">
+        <div class="name">Luna</div>
+        <div id="status" class="status">в сети</div>
+      </div>
       <button id="menuBtn" class="icon-btn" aria-label="Меню">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
       </button>
     </header>
+
+    <nav id="effort" class="seg" aria-label="Глубина мышления">
+      <button data-depth="fast">⚡ Быстро</button>
+      <button data-depth="normal">⚖️ Обычно</button>
+      <button data-depth="deep">🧠 Глубоко</button>
+      <button data-depth="auto">🤖 Авто</button>
+    </nav>
 
     <main id="chat" class="chat"><div id="list" class="list"></div></main>
 

@@ -6,7 +6,7 @@
   const tg = window.Telegram && window.Telegram.WebApp;
   const $ = (s) => document.querySelector(s);
   const listEl = $('#list'), chatEl = $('#chat'), inputEl = $('#input'), sendEl = $('#send');
-  const depthBtn = $('#depthBtn'), menuBtn = $('#menuBtn');
+  const effortEl = $('#effort'), statusEl = $('#status'), menuBtn = $('#menuBtn');
   const sheetEl = $('#sheet'), overlayEl = $('#overlay'), toastEl = $('#toast');
 
   const S = {
@@ -22,6 +22,7 @@
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const plural = (n, a, b, c) => { const m = n % 10, h = n % 100; return m === 1 && h !== 11 ? a : m >= 2 && m <= 4 && (h < 10 || h >= 20) ? b : c; };
+  const hhmm = (t) => { const d = new Date(t); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
   const haptic = (k = 'light') => { try { tg.HapticFeedback.impactOccurred(k); } catch (e) { /* не в Telegram */ } };
 
   function toast(text) {
@@ -129,15 +130,14 @@
     return `${chip}<div class="think-body">${items.join('')}</div>`;
   }
 
+  // Кнопки под сообщением бота — как inline-клавиатура в Telegram.
   function actionsHtml(m) {
-    if (!m.done || m.typing) return '';
+    if (!m.done || m.typing || m.error || !m.text) return '';
     const last = m === lastAssistant();
-    const busy = S.busy;
-    return `<div class="actions">
-      <button class="act" data-act="copy" title="Копировать">${ICON.copy}</button>
-      ${last && S.hasLast && !busy ? `<button class="act" data-act="again" title="Заново">${ICON.redo}</button>
-      <button class="act" data-act="short">Короче</button><button class="act" data-act="long">Подробнее</button>` : ''}
-    </div>`;
+    const rows = [];
+    if (last && S.hasLast && !S.busy) rows.push('<div class="kbrow"><button class="kbtn" data-act="again">🔄 Заново</button><button class="kbtn" data-act="short">✂️ Короче</button><button class="kbtn" data-act="long">➕ Подробнее</button></div>');
+    rows.push('<div class="kbrow"><button class="kbtn" data-act="copy">📋 Копировать</button></div>');
+    return `<div class="kb">${rows.join('')}</div>`;
   }
 
   function msgEl(m) {
@@ -147,11 +147,11 @@
     root.className = `msg ${m.role}`;
     root.dataset.id = m.id;
     if (m.role === 'user') {
-      root.innerHTML = `<div class="bubble">${esc(m.text)}</div>`;
+      root.innerHTML = `<div class="bubble me">${esc(m.text)}${m.at ? `<span class="stamp">${hhmm(m.at)}</span>` : ''}</div>`;
       e = { root };
     } else {
-      root.innerHTML = '<div class="a-body"></div><div class="think"></div><div class="actions-w"></div>';
-      e = { root, body: root.querySelector('.a-body'), think: root.querySelector('.think'), actions: root.querySelector('.actions-w'), cache: {} };
+      root.innerHTML = '<div class="bubble bot"><div class="a-body"></div><div class="think"></div><div class="stamp"></div></div><div class="kb-w"></div>';
+      e = { root, bubble: root.querySelector('.bubble'), body: root.querySelector('.a-body'), think: root.querySelector('.think'), stamp: root.querySelector('.stamp'), actions: root.querySelector('.kb-w'), cache: {} };
     }
     els.set(m.id, e);
     listEl.appendChild(root);
@@ -175,7 +175,10 @@
     let body = '';
     if (m.error) body = `<div class="a-error"><span>⚠️ ${esc(m.error)}</span><button data-act="retry">Повторить</button></div>`;
     else if (shown) body = md(shown, m.typing || !m.done);
+    else if (!m.done) body = '<span class="typing" aria-label="печатает"><i></i><i></i><i></i></span>';   // мигающие точки, пока ответа ещё нет
+    e.bubble.classList.toggle('hidden', !body && !m.error);
     setHtml(e, 'body', e.body, body);
+    if (m.at && m.done && !m.typing && !m.error) setHtml(e, 'stamp', e.stamp, hhmm(m.at + (m.ms || 0)));
     setHtml(e, 'think', e.think, m.restored || (m.error && !m.trace.length) ? '' : thinkHtml(m));
     setHtml(e, 'actions', e.actions, actionsHtml(m));
   }
@@ -273,8 +276,8 @@
       const prev = lastAssistant();
       if (prev) S.messages.splice(S.messages.indexOf(prev), 1);
     }
-    if (!regen && !mode && !again) addMessage({ role: 'user', text: text.trim() });
-    const m = addMessage({ role: 'assistant', text: '', shown: 0, trace: [], live: '', done: false, typing: false, open: false, openTools: new Set(), t0: Date.now(), ms: null, error: null });
+    if (!regen && !mode && !again) addMessage({ role: 'user', text: text.trim(), at: Date.now() });
+    const m = addMessage({ role: 'assistant', text: '', shown: 0, trace: [], live: '', done: false, typing: false, open: false, openTools: new Set(), t0: Date.now(), at: Date.now(), ms: null, error: null });
     renderAll();
     toBottom(true);
     const runId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -322,6 +325,8 @@
   function updateComposer() {
     sendEl.disabled = S.busy || !inputEl.value.trim();
     sendEl.classList.toggle('busy', S.busy);
+    statusEl.textContent = S.busy ? 'печатает…' : 'в сети';
+    statusEl.classList.toggle('typing-now', S.busy);
   }
   inputEl.addEventListener('input', () => { autosize(); updateComposer(); });
   inputEl.addEventListener('keydown', (e) => {
@@ -378,7 +383,7 @@
     deep: ['🧠', 'Глубоко', 'Долго думаю: сложные задачи, математика, код'],
   };
   const depthLabel = () => { const d = DEPTH_INFO[S.depth] || DEPTH_INFO.auto; return `${d[0]} ${d[1]}`; };
-  const paintDepth = () => { depthBtn.innerHTML = `${esc(depthLabel())} <span class="chev">▾</span>`; };
+  const paintDepth = () => effortEl.querySelectorAll('[data-depth]').forEach((b) => b.classList.toggle('on', b.dataset.depth === S.depth));
 
   function openSheet(html) {
     sheetEl.innerHTML = `<div class="grab"></div>${html}`;
@@ -389,12 +394,11 @@
   function closeSheet() { sheetEl.classList.add('hidden'); overlayEl.classList.add('hidden'); }
   overlayEl.addEventListener('click', closeSheet);
 
-  depthBtn.addEventListener('click', () => {
-    haptic('light');
-    openSheet(`<h3>Глубина мышления</h3>${['fast', 'normal', 'deep', 'auto'].map((k) => {
-      const d = DEPTH_INFO[k];
-      return `<button class="opt ${S.depth === k ? 'sel' : ''}" data-depth="${k}"><span class="em">${d[0]}</span><span class="tx"><b>${d[1]}</b><span>${d[2]}</span></span>${S.depth === k ? '<span class="ck">✓</span>' : ''}</button>`;
-    }).join('')}`);
+  effortEl.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-depth]');
+    if (!btn) return;
+    S.depth = btn.dataset.depth; paintDepth(); haptic('light');
+    try { await rpc('setDepth', { depth: S.depth }); toast(`${depthLabel()} — выбрано`); } catch (e) { toast('Не удалось сохранить'); }
   });
 
   function menuHtml() {
@@ -415,13 +419,6 @@
   menuBtn.addEventListener('click', () => { haptic('light'); openSheet(menuHtml()); });
 
   sheetEl.addEventListener('click', async (ev) => {
-    const dep = ev.target.closest('[data-depth]');
-    if (dep) {
-      const key = dep.dataset.depth;
-      S.depth = key; paintDepth(); closeSheet(); haptic('light');
-      try { await rpc('setDepth', { depth: key }); toast(`${depthLabel()} — выбрано`); } catch (e) { toast('Не удалось сохранить'); }
-      return;
-    }
     const act = ev.target.closest('[data-menu]');
     if (!act) return;
     switch (act.dataset.menu) {
