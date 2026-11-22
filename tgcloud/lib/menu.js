@@ -4,6 +4,7 @@ import { esc } from './fmt.js';
 import { ACTIONS } from './rp.js';
 import { PERSONAS, personaLabel, listFacts, DEPTHS, getDepth } from './ai.js';
 import { botUsername } from './store.js';
+import { getGhLogin } from './github.js';
 import { AI_DAILY_LIMIT, AI_MAX_FACTS } from './config.js';
 
 const b = (text, data) => ({ text, callback_data: data });
@@ -12,6 +13,25 @@ const BACK = [b('◀️ Меню', 'm:home')];
 
 // Кнопки под каждым ответом ИИ в личке.
 export const answerKb = () => kb([[b('🔄 Заново', 'r:again'), b('✂️ Короче', 'r:short'), b('➕ Подробнее', 'r:long')]]);
+
+export async function githubScreen(user) {
+  const login = await getGhLogin(user.tgId);
+  return {
+    text: '🐙 <b>GitHub</b> (только чтение)\n\n' +
+      (login
+        ? `Подключён: <b>@${esc(login)}</b>. Просите прямо в чате: «посмотри репозиторий …», «что в README», «найди в коде …», «какие открытые issues».\n\n`
+        : 'Не подключён. Тогда я смогу читать ваши репозитории, issues, PR и коммиты — по вашей просьбе, ничего не меняя.\n\n') +
+      '<b>Как подключить</b>\n' +
+      '1. github.com/settings/personal-access-tokens/new — токен <i>fine-grained</i>\n' +
+      '2. Repository access — нужные репозитории\n' +
+      '3. Permissions (Read-only): Contents, Issues, Pull requests, Metadata\n' +
+      '4. Нажмите «🔑 Подключить» и пришлите токен (сообщение с ним я удалю) — или командой <code>/github ТОКЕН</code>',
+    kb: kb([
+      [b(login ? '🔑 Сменить токен' : '🔑 Подключить', 'gh:connect'), ...(login ? [b('🔌 Отключить', 'gh:off')] : [])],
+      BACK,
+    ]),
+  };
+}
 
 export async function depthScreen(user) {
   const cur = await getDepth(user.tgId);
@@ -76,7 +96,7 @@ export async function homeScreen(user) {
     kb: kb([
       [b('🧠 Память', 'm:mem'), b('🎭 Персона', 'm:persona')],
       [b('🎬 РП', 'm:rp'), b('👤 Профиль', 'm:profile')],
-      [b('🧩 Глубина мышления', 'm:depth')],
+      [b('🧩 Глубина мышления', 'm:depth'), b('🐙 GitHub', 'm:github')],
       [b('🛡 Добавить в группу', 'm:groups'), b('❓ Помощь', 'm:help')],
     ]),
   };
@@ -162,6 +182,7 @@ export const helpScreen = () => ({
     '• /new — новый диалог · /memory — память · /remember текст · /forget N',
     '• под ответом кнопки: 🔄 заново · ✂️ короче (быстрее и лаконичнее) · ➕ подробнее',
     '• /depth — глубина мышления: быстро / обычно / глубоко',
+    '• /github — подключить GitHub (чтение): «посмотри репозиторий…», «найди в коде…»',
     '• /persona — стиль ИИ · /gender м|ж · /id · /menu',
     '',
     HELP_GROUP,
@@ -175,6 +196,7 @@ export async function renderScreen(name, user) {
     case 'mem': return memScreen(user);
     case 'persona': return personaScreen(user);
     case 'depth': return depthScreen(user);
+    case 'github': return githubScreen(user);
     case 'profile': return profileScreen(user);
     case 'rp': return rpScreen();
     case 'groups': return groupsScreen();

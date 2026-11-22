@@ -13,7 +13,8 @@ import { logAi, statsText, logText, userText } from './stats.js';
 import {
   pickMedia, loadImage, downloadFile, toDataUrl, transcribe, generateImage, editImage, sendImage,
 } from './media.js';
-import { homeScreen, helpScreen, rpList, personaScreen, memScreen, depthScreen, answerKb } from './menu.js';
+import { homeScreen, helpScreen, rpList, personaScreen, memScreen, depthScreen, githubScreen, answerKb } from './menu.js';
+import { ghWhoami, ghErrorText, setGhToken } from './github.js';
 import { isOwner, AI_IMAGE_QUOTA_COST, AI_IMAGE_TTL, AI_MAX_AUDIO_SEC, AI_STREAM } from './config.js';
 
 export async function handlePrivate(msg) {
@@ -90,6 +91,8 @@ export async function chat(msg, user, input, { imageId = null, skipQuota = false
       const out = await askAi({
         userId: user.tgId, name: user.name, persona: user.persona, input, useMemory: user.aiMemory !== false,
         images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true, onText, mode, replaceLast: replace,
+        github: true,   // функции GitHub — только в личке (в группах чужие приватные репозитории светить нельзя)
+        onTrace: async (e) => { if (e.k === 'tool' && e.state === 'run') await setStatus(`🐙 ${e.label}…`); },
       });
       await logAi({ from: msg.from, kind, input, model: out.model, usage: out.usage });   // токены уже потрачены
       // Финальная версия: убирает курсор, досылает хвост длинного ответа; под текстом — кнопки «Заново / Короче / Подробнее».
@@ -188,9 +191,35 @@ async function handleAwaiting(msg, user, text) {
     const ok = await addFact(user.tgId, text);
     return void (await say(msg, ok ? '🧠 Запомнил.' : 'ℹ️ Такой факт уже есть или он слишком короткий.'));
   }
+  if (user.awaiting === 'ghtoken') return githubCommand(msg, user, text.trim());
   if (user.awaiting === 'persona') {
     await patchUser(user.tgId, { persona: text.slice(0, 500) });
     return void (await say(msg, '🎭 Персона обновлена. Новый диалог начнётся с этим стилем.'));
+  }
+}
+
+// ── GitHub-коннектор ─────────────────────────────────────────────────────
+
+// /github — экран; /github off — отключить; /github ТОКЕН — подключить (сообщение с токеном удаляем).
+async function githubCommand(msg, user, token) {
+  if (!token) {
+    const s = await githubScreen(user);
+    return void (await say(msg, s.text, { reply_markup: s.kb }));
+  }
+  if (/^(off|выкл|отключить)$/i.test(token)) {
+    await setGhToken(user.tgId, '');
+    return void (await say(msg, '🔌 GitHub отключён, токен удалён.'));
+  }
+  await api.deleteMessage({ chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {});
+  try {
+    const me = await ghWhoami(token);
+    await setGhToken(user.tgId, token, me.login);
+    const wide = /\b(repo|write|delete|admin)/.test(me.scopes ?? '');
+    await say(msg, `🐙 GitHub подключён: <b>@${esc(me.login)}</b>. Сообщение с токеном удалено.\n` +
+      'Я только читаю: репозитории, файлы, issues, PR, коммиты.' +
+      (wide ? '\n⚠️ У токена широкие права. Надёжнее fine-grained токен только для чтения.' : ''));
+  } catch (e) {
+    await say(msg, `⚠️ Токен не подошёл: ${esc(ghErrorText(e))}`);
   }
 }
 
@@ -227,6 +256,9 @@ async function runCommand(msg, user, cmd) {
     case 'cancel':
       await patchUser(user.tgId, { awaiting: null });
       return void (await say(msg, 'Отменено.'));
+    case 'github':
+    case 'gh':
+      return githubCommand(msg, user, arg(cmd));
     case 'depth':
     case 'глубина': {
       const s = await depthScreen(user);

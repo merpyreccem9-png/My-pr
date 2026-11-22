@@ -5,6 +5,7 @@ import { touchUser, patchUser, kvGetMany } from './store.js';
 import { renderScreen, memClearConfirm, cancelKb } from './menu.js';
 import { PERSONAS, DEPTHS, setDepth, lastKey, clearFacts, clearHistory } from './ai.js';
 import { chat } from './private.js';
+import { setGhToken } from './github.js';
 import { notModified } from './tg.js';
 
 async function edit(msg, screen) {
@@ -70,6 +71,15 @@ export async function onMenuCallback(cq) {
   }
 
   switch (data) {
+    case 'gh:connect':
+      await patchUser(user.tgId, { awaiting: 'ghtoken' });
+      return edit(msg, { text: '🔑 Пришлите токен GitHub одним сообщением (оно будет удалено). Права — только чтение.', kb: cancelKb() });
+
+    case 'gh:off':
+      await setGhToken(user.tgId, '');
+      await show('github');
+      return { text: '🔌 GitHub отключён' };
+
     case 'ai:new':
       await clearHistory(user.tgId);
       await show('mem');

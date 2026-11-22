@@ -5,6 +5,7 @@ import { eq, and, asc, desc, lt, inArray, sql } from 'sdk/db';
 import { history, facts, usage } from '../schema.js';
 import { kvGetMany, kvSet } from './store.js';
 import { deLatex } from './fmt.js';
+import { GH_TOOLS, isGhTool, runGhTool, ghLabel, ghKey } from './github.js';
 import {
   AI_MAX_TOKENS, AI_HISTORY, AI_MAX_FACTS, AI_MAX_INPUT, AI_DAILY_LIMIT, LIMITS, isOwner,
   AI_DEFAULT_BASE_URL, AI_DEFAULT_MODEL, AI_DEFAULT_EFFORT, AI_REASONING_MAX_TOKENS, AI_IMAGE_MODEL, AI_STT_MODEL,
@@ -228,11 +229,17 @@ async function collectChatStream(res, onText) {
 }
 
 // /responses со stream:true: текст показываем по дельтам, а итог берём из финального события response.completed.
-async function collectResponsesStream(res, onText) {
+async function collectResponsesStream(res, onText, agent = null) {
   let text = '';
+  let think = '';
   let final = null;
   await readSse(res, async (ev) => {
     if (ev.type === 'response.output_text.delta' && ev.delta) { text += ev.delta; await onText(text); }
+    else if (ev.type === 'response.reasoning_summary_part.added') { if (think) think += '\n\n'; }
+    else if (ev.type === 'response.reasoning_summary_text.delta' && ev.delta) {
+      think += ev.delta;
+      await agent?.onTrace?.({ k: 'think_live', t: think });   // «как он думает» — вживую
+    }
     else if (ev.type === 'response.completed' || ev.type === 'response.incomplete') final = ev.response;
     else if (ev.type === 'response.failed' || ev.type === 'error') {
       throw new AiError('http', JSON.stringify(ev.response?.error ?? ev.error ?? ev).slice(0, 300));
@@ -294,9 +301,10 @@ async function completeChat(cfg, messages, tools, unlimited = false, onText = nu
 
 // Модели с рассуждением не принимают функции в /chat/completions («Function tools with reasoning_effort are
 // not supported»), поэтому запрос с инструментами и effort идёт в /responses; остальное — в /chat/completions.
-async function complete(cfg, messages, tools, unlimited = false, onText = null) {
+async function complete(cfg, messages, tools, unlimited = false, onText = null, agent = null) {
   const reasoning = cfg.effort && cfg.effort !== 'none';
-  if (reasoning && tools?.length) return completeResponses(cfg, messages, tools, unlimited, onText);
+  // /responses нужен для рассуждения с функциями, для GitHub-цикла и для сводки «как он думает».
+  if ((reasoning && (tools?.length || agent?.summary)) || agent?.hasGh) return completeResponses(cfg, messages, tools, unlimited, onText, agent);
   return completeChat(cfg, messages, tools, unlimited, onText);
 }
 
@@ -313,15 +321,16 @@ const toResponsesTools = (tools) => tools.map((t) => ({
   type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters,
 }));
 
-async function completeResponses(cfg, messages, tools, unlimited, onText = null) {
-  const body = {
-    model: cfg.model,
-    input: toResponsesInput(messages),
-    reasoning: { effort: cfg.effort },
-    tools: toResponsesTools(tools),
-    tool_choice: 'auto',
-    store: false,
-  };
+// Один запрос к /responses. → { data } или { final } (если пришлось уйти на chat/completions).
+async function responsesOnce(ctx, input, onText) {
+  const { cfg, messages, tools, unlimited, agent, flags } = ctx;
+  const body = { model: cfg.model, input, store: false };
+  if (cfg.effort) {
+    body.reasoning = { effort: cfg.effort };
+    if (flags.summary) body.reasoning.summary = 'auto';                       // краткое изложение мыслей — для панели «как он думает»
+    if (flags.include) body.include = ['reasoning.encrypted_content'];       // чтобы мысли переживали шаги с функциями при store:false
+  }
+  if (tools.length) { body.tools = toResponsesTools(tools); body.tool_choice = 'auto'; }
   if (!unlimited) body.max_output_tokens = AI_REASONING_MAX_TOKENS;   // «мысли» тоже входят в лимит
   if (onText) body.stream = true;
 
@@ -333,36 +342,92 @@ async function completeResponses(cfg, messages, tools, unlimited, onText = null)
   const streaming = Boolean(onText) && res.ok && isSse(res);
   const raw = streaming ? '' : await res.text();
   if (!res.ok) {
+    // Сводка мыслей или include не поддерживаются (например, организация не подтверждена) — повторяем без них.
+    if (flags.summary && res.status === 400 && /summar/i.test(raw)) {
+      flags.summary = false;
+      return responsesOnce(ctx, input, onText);
+    }
+    if (flags.include && res.status === 400 && /include|encrypted/i.test(raw)) {
+      flags.include = false;
+      return responsesOnce(ctx, input, onText);
+    }
     // Провайдер без /responses или модель без рассуждения: обычный запрос с effort=none (функции там разрешены).
     if (res.status === 404 || res.status === 405 || (res.status === 400 && /reasoning/i.test(raw))) {
       console.warn('/responses not usable, falling back to chat/completions', res.status, cfg.model);
-      return completeChat({ ...cfg, effort: 'none' }, messages, tools, unlimited, onText);
+      const chatTools = tools.filter((t) => !isGhTool(t.function.name));   // цикл GitHub живёт только в /responses
+      return { final: await completeChat({ ...cfg, effort: 'none' }, messages, chatTools, unlimited, onText) };
     }
     // Потоковый режим недоступен (например, организация не подтверждена) — повторяем без потока.
     if (onText && res.status === 400 && /stream/i.test(raw)) {
       console.warn('stream rejected, retrying without streaming', cfg.model);
-      return completeResponses(cfg, messages, tools, unlimited, null);
+      return responsesOnce(ctx, input, null);
     }
     throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
   }
-  let data;
   if (streaming) {
-    try { data = await collectResponsesStream(res, onText); } catch (e) { throw asAiError(e); }
-  } else {
-    try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
+    try { return { data: await collectResponsesStream(res, onText, agent) }; } catch (e) { throw asAiError(e); }
   }
-  const out = Array.isArray(data?.output) ? data.output : [];
-  const content = out
-    .filter((o) => o.type === 'message')
-    .flatMap((o) => (Array.isArray(o.content) ? o.content : []))
-    .filter((c) => c.type === 'output_text' && c.text)
-    .map((c) => c.text)
-    .join('')
-    .trim();
-  const fc = out.find((o) => o.type === 'function_call');
-  const call = fc ? { name: fc.name, arguments: fc.arguments } : undefined;
-  if (!content && !call) throw new AiError('empty', data?.incomplete_details?.reason ?? data?.status ?? '');
-  return { content, call, usage: usageOf(data.usage, 'input_tokens', 'output_tokens', 'output_tokens_details') };
+  try { return { data: JSON.parse(raw) }; } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
+}
+
+const safeJson = (s) => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
+
+// Цикл «модель → функции GitHub → модель…» (до agent.maxSteps шагов); картинки и обычный ответ — как раньше.
+async function completeResponses(cfg, messages, tools, unlimited, onText = null, agent = null) {
+  const ctx = {
+    cfg, messages, tools, unlimited, agent,
+    flags: { summary: Boolean(agent?.summary), include: Boolean(agent?.hasGh) },
+  };
+  let input = toResponsesInput(messages);
+  const total = { in: 0, out: 0, think: 0 };
+
+  for (let step = 0; ; step++) {
+    const r = await responsesOnce(ctx, input, onText);
+    if (r.final) return { ...r.final, usage: { in: total.in + r.final.usage.in, out: total.out + r.final.usage.out, think: total.think + r.final.usage.think } };
+
+    const { data } = r;
+    const out = Array.isArray(data?.output) ? data.output : [];
+    const u = usageOf(data.usage, 'input_tokens', 'output_tokens', 'output_tokens_details');
+    total.in += u.in; total.out += u.out; total.think += u.think;
+
+    if (agent?.onTrace) {
+      for (const o of out) {
+        if (o.type !== 'reasoning') continue;
+        const t = (Array.isArray(o.summary) ? o.summary : []).map((x) => x?.text).filter(Boolean).join('\n\n');
+        if (t) await agent.onTrace({ k: 'think', t });
+      }
+    }
+
+    const calls = out.filter((o) => o.type === 'function_call');
+    const mine = calls.filter((o) => agent?.isTool?.(o.name));
+    if (!mine.length || mine.length !== calls.length) {
+      const content = out
+        .filter((o) => o.type === 'message')
+        .flatMap((o) => (Array.isArray(o.content) ? o.content : []))
+        .filter((c) => c.type === 'output_text' && c.text)
+        .map((c) => c.text)
+        .join('')
+        .trim();
+      const fc = calls[0];
+      const call = fc ? { name: fc.name, arguments: fc.arguments } : undefined;
+      if (!content && !call) throw new AiError('empty', data?.incomplete_details?.reason ?? data?.status ?? '');
+      return { content, call, usage: total };
+    }
+
+    // Выполняем функции GitHub и возвращаем модели результаты.
+    const exhausted = step >= agent.maxSteps;
+    input = [...input, ...out];
+    for (const c of mine) {
+      const args = safeJson(c.arguments);
+      const id = c.call_id;
+      await agent.onTrace?.({ k: 'tool', id, name: c.name, args, label: ghLabel(c.name, args), state: 'run' });
+      const t0 = Date.now();
+      const result = exhausted ? 'Лимит шагов исчерпан — ответь по уже полученным данным.' : String(await agent.runTool(c.name, args));
+      await agent.onTrace?.({ k: 'tool', id, state: /^Ошибка:/.test(result) ? 'err' : 'ok', out: result.slice(0, 1500), ms: Date.now() - t0 });
+      input.push({ type: 'function_call_output', call_id: id, output: result });
+    }
+    if (exhausted) ctx.tools = [];
+  }
 }
 
 // Вызов функции модели → запрос на картинку или null.
@@ -377,9 +442,16 @@ function imageRequest(call, canEdit) {
   return { kind, prompt, size };
 }
 
-export function buildSystemPrompt({ name, persona, facts: factList, canImage = false, summary = '' }) {
+const GITHUB_PROMPT = [
+  'У пользователя подключён GitHub (только чтение) — функции github_*.',
+  'Если просят посмотреть код, репозиторий, файл, issue, PR или коммиты — вызывай функции и опирайся на их результат, ничего не выдумывай.',
+  'Репозиторий указывай как owner/name. Сначала найди нужное (список репозиториев, папка, поиск), потом читай файлы. Менять что-либо на GitHub ты не можешь — не обещай этого.',
+].join(' ');
+
+export function buildSystemPrompt({ name, persona, facts: factList, canImage = false, summary = '', github = false }) {
   const parts = [BASE_PROMPT];
   if (canImage) parts.push(IMAGE_PROMPT);
+  if (github) parts.push(GITHUB_PROMPT);
   if (persona) parts.push(`Стиль общения: ${persona}`);
   if (name) parts.push(`Собеседника зовут ${name}.`);
   if (factList.length) parts.push(`Что известно о собеседнике:\n${factList.map((f) => `- ${f}`).join('\n')}`);
@@ -432,15 +504,18 @@ async function foldIntoSummary(cfg, userId, stored, rows) {
  * images — data-URL картинок (модель их «видит»); canImage — разрешить рисование/правку через функции.
  * mode — 'short' (легче модель/effort, «ответь кратко») | 'long' (effort не ниже high, «ответь подробнее»);
  *   подсказка уходит модели, а в историю пишется исходный вопрос. replaceLast — заменить последний обмен (кнопки «Заново/Короче/Подробнее»).
+ * github — дать модели функции GitHub пользователя (только личка/Mini App, не группы); onTrace(entry, trace) — ход работы
+ *   («мысли» и команды); thinkSummary — просить у модели краткое изложение мыслей.
  * onText(текст) — необязательный колбэк: включает потоковый режим и получает ответ по мере генерации (уже очищенный).
  * @returns {{ text: string, image: ?{kind,prompt,size}, commit: () => Promise<void> }}
  *   commit() сохраняет память — вызывайте ПОСЛЕ отправки ответа.
  */
-export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false, onText = null, mode = null, replaceLast = false }) {
+export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false, onText = null, mode = null, replaceLast = false, github = false, onTrace = null, thinkSummary = false }) {
   const base = await getAiConfig();
   if (!base) throw new AiError('not_configured');
 
-  const stored = await kvGetMany([depthKey(userId), sumKey(userId), pendKey(userId)]);
+  const stored = await kvGetMany([depthKey(userId), sumKey(userId), pendKey(userId), ghKey(userId)]);
+  const ghToken = github ? stored[ghKey(userId)] || null : null;
   const depthEffort = DEPTHS[stored[depthKey(userId)]]?.[1] ?? null;
   let effort = base.effort && depthEffort ? depthEffort : base.effort;   // «Глубина» — только если модель вообще с рассуждением
   let hint = '';
@@ -473,11 +548,24 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
       ]
     : asked;
   const messages = [
-    { role: 'system', content: buildSystemPrompt({ name, persona, facts: factRows.map((f) => f.body), canImage, summary: useMemory ? stored[sumKey(userId)] ?? '' : '' }) },
+    { role: 'system', content: buildSystemPrompt({ name, persona, facts: factRows.map((f) => f.body), canImage, github: Boolean(ghToken), summary: useMemory ? stored[sumKey(userId)] ?? '' : '' }) },
     ...hist.slice().reverse().map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userContent },
   ];
-  const tools = canImage ? [TOOL_GENERATE, ...(hasImage ? [TOOL_EDIT] : [])] : [];
+  const tools = [...(canImage ? [TOOL_GENERATE, ...(hasImage ? [TOOL_EDIT] : [])] : []), ...(ghToken ? GH_TOOLS : [])];
+
+  // Ход работы: «мысли» и команды. Записи одной команды (по id) склеиваются: запуск → результат.
+  const trace = [];
+  const emitTrace = async (e) => {
+    if (e.k === 'tool') {
+      const at = trace.findIndex((x) => x.k === 'tool' && x.id === e.id);
+      if (at >= 0) trace[at] = { ...trace[at], ...e }; else trace.push(e);
+    } else if (e.k === 'think') trace.push(e);
+    await onTrace?.(e, trace);
+  };
+  const agent = ghToken || (onTrace && thinkSummary)
+    ? { hasGh: Boolean(ghToken), summary: thinkSummary, isTool: isGhTool, runTool: (name, args) => runGhTool(ghToken, name, args), onTrace: emitTrace, maxSteps: 8 }
+    : null;
 
   // Чистим и отдаём текст не чаще раза в 400 мс: итог всё равно придёт целиком в конце.
   let lastEmit = 0;
@@ -491,7 +579,7 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
       }
     : null;
 
-  const { content, call, usage: tokens } = await complete(cfg, messages, tools, !LIMITS.enabled || isOwner(userId), emit);
+  const { content, call, usage: tokens } = await complete(cfg, messages, tools, !LIMITS.enabled || isOwner(userId), emit, agent);
   const { text, found } = extractMemory(content);
   const answer = deLatex(text || content);    // модель любит LaTeX, а Telegram его не рисует
   const image = imageRequest(call, hasImage);
@@ -518,7 +606,7 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
     for (const f of found.slice(0, 1)) await addFact(userId, f, factRows);
   };
 
-  return { text: answer, image, usage: tokens, model: cfg.model, commit };
+  return { text: answer, image, usage: tokens, model: cfg.model, trace, commit };
 }
 
 // ── Долговременная память ────────────────────────────────────────────────
