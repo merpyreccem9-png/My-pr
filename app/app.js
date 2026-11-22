@@ -6,6 +6,7 @@
   const tg = window.Telegram && window.Telegram.WebApp;
   const $ = (s) => document.querySelector(s);
   const listEl = $('#list'), chatEl = $('#chat'), inputEl = $('#input'), sendEl = $('#send');
+  const trayEl = $('#tray'), fileEl = $('#file'), attachEl = $('#attach');
   const effortEl = $('#effort'), statusEl = $('#status'), menuBtn = $('#menuBtn');
   const sheetEl = $('#sheet'), overlayEl = $('#overlay'), toastEl = $('#toast');
 
@@ -13,6 +14,7 @@
     name: '', owner: false, configured: true, model: '', depth: 'auto',
     github: { connected: false, login: null }, facts: [],
     messages: [], busy: false, hasLast: false,
+    pending: { image: null, files: [] },   // вложения, ещё не отправленные
   };
   let seq = 0;
   const nid = () => `m${++seq}`;
@@ -39,6 +41,72 @@
     });
   }
   const isEndpointErr = (e) => e && e.type === 'ENDPOINT_ERROR';
+
+  // ── Подсветка кода (без библиотек) ────────────────────────────────────────
+  const KW = {
+    js: 'break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|of|return|super|switch|throw|try|typeof|var|void|while|with|yield|async|await|static|get|set|from|as|interface|type|enum|implements|public|private|protected|readonly|declare|namespace',
+    py: 'and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|match|case',
+    c: 'if|else|for|while|do|switch|case|break|continue|return|goto|struct|union|enum|typedef|static|const|volatile|extern|inline|sizeof|class|public|private|protected|virtual|override|namespace|using|template|typename|new|delete|try|catch|throw|import|package|interface|extends|implements|final|abstract|void|int|long|short|char|float|double|bool|boolean|unsigned|signed|string|var|val|fun|func|fn|let|mut|impl|trait|pub|mod|use|match|go|defer|chan|select|range|map|async|await|where|in|is|as|object|when|echo|function',
+    sh: 'if|then|else|elif|fi|for|while|until|do|done|case|esac|function|in|return|export|local|source|alias|unset|set|echo|cd|ls|cat|grep|sed|awk|npm|npx|git|pip|python|python3|node|sudo|apt|pkg|curl|wget|mkdir|rm|cp|mv|chmod|tar|cargo|docker',
+    sql: 'select|from|where|and|or|not|insert|into|values|update|set|delete|create|table|drop|alter|add|column|index|join|left|right|inner|outer|on|as|group|by|order|having|limit|offset|union|distinct|null|is|in|like|between|primary|key|foreign|references|default|unique|count|sum|avg|min|max|case|when|then|else|end|exists|desc|asc',
+  };
+  const LIT = 'true|false|null|undefined|NaN|Infinity|None|True|False|nil|this|self|NULL';
+  const STR = String.raw`"(?:\\[\s\S]|[^"\\\n])*"?|'(?:\\[\s\S]|[^'\\\n])*'?`;
+  const NUM = String.raw`\b(?:0x[\da-f]+|0b[01]+|\d[\d_]*(?:\.\d+)?(?:e[+-]?\d+)?)\b`;
+  const TRIPLE = String.raw`"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)`;
+  const BACKTICK = '`(?:\\\\[\\s\\S]|[^`\\\\])*`?';
+  const sticky = (src, flags = '') => new RegExp(src, `y${flags}`);
+  const kw = (k, flags = '') => sticky(String.raw`\b(?:${KW[k]})\b`, flags);
+  const COMMON_TAIL = [
+    ['l', sticky(String.raw`\b(?:${LIT})\b`)],
+    ['f', sticky(String.raw`[A-Za-z_$][\w$]*(?=\s*\()`)],
+    ['t', sticky(String.raw`\b[A-Z][\w$]*\b`)],
+    ['', sticky(String.raw`[A-Za-z_$][\w$]*`)],
+  ];
+  const SLASH_COMMENT = String.raw`//[^\n]*|/\*[\s\S]*?(?:\*/|$)`;
+  const RULES = {
+    js: [['c', sticky(SLASH_COMMENT)], ['s', sticky(`${STR}|${BACKTICK}`)], ['n', sticky(NUM, 'i')], ['k', kw('js')], ...COMMON_TAIL],
+    c: [['c', sticky(`${SLASH_COMMENT}|#[^\\n]*`)], ['s', sticky(STR)], ['n', sticky(NUM, 'i')], ['k', kw('c')], ...COMMON_TAIL],
+    py: [['c', sticky(String.raw`#[^\n]*`)], ['s', sticky(`${TRIPLE}|${STR}`)], ['f', sticky(String.raw`@[\w.]+`)], ['n', sticky(NUM, 'i')], ['k', kw('py')], ...COMMON_TAIL],
+    sh: [['c', sticky(String.raw`#[^\n]*`)], ['s', sticky(STR)], ['v', sticky(String.raw`\$\{[^}\n]*\}?|\$[\w@#?*!-]+`)], ['p', sticky(String.raw`--?[A-Za-z][\w-]*`)], ['n', sticky(NUM, 'i')], ['k', kw('sh')], ['', sticky(String.raw`[\w./~-]+`)]],
+    sql: [['c', sticky(String.raw`--[^\n]*|/\*[\s\S]*?(?:\*/|$)`)], ['s', sticky(STR)], ['n', sticky(NUM, 'i')], ['k', kw('sql', 'i')], ['f', sticky(String.raw`[A-Za-z_]\w*(?=\s*\()`)], ['', sticky(String.raw`[A-Za-z_]\w*`)]],
+    json: [['p', sticky(String.raw`"(?:\\.|[^"\\\n])*"(?=\s*:)`)], ['s', sticky(STR)], ['n', sticky(NUM, 'i')], ['l', sticky(String.raw`\b(?:true|false|null)\b`)]],
+    html: [['c', sticky(String.raw`<!--[\s\S]*?(?:-->|$)`)], ['g', sticky(String.raw`</?[A-Za-z][\w:-]*|/?>`)], ['p', sticky(String.raw`[A-Za-z_:@][\w:.-]*(?==)`)], ['s', sticky(STR)]],
+    css: [['c', sticky(String.raw`/\*[\s\S]*?(?:\*/|$)`)], ['s', sticky(STR)], ['k', sticky(String.raw`@[\w-]+`)], ['p', sticky(String.raw`[A-Za-z-]+(?=\s*:)`)], ['n', sticky(String.raw`#[\da-f]{3,8}\b|-?\d*\.?\d+(?:px|em|rem|%|vh|vw|s|ms|deg|fr)?`, 'i')], ['t', sticky(String.raw`[.#][A-Za-z_][\w-]*`)], ['', sticky(String.raw`[A-Za-z_-][\w-]*`)]],
+    yaml: [['c', sticky(String.raw`#[^\n]*`)], ['s', sticky(STR)], ['p', sticky(String.raw`[\w./-]+(?=:(?:\s|$))`)], ['n', sticky(NUM, 'i')], ['l', sticky(String.raw`\b(?:true|false|null|yes|no)\b`)], ['', sticky(String.raw`[\w./-]+`)]],
+  };
+  const FAMILY = {
+    js: 'js', javascript: 'js', jsx: 'js', ts: 'js', typescript: 'js', tsx: 'js', mjs: 'js', cjs: 'js', node: 'js', vue: 'js',
+    py: 'py', python: 'py', python3: 'py',
+    sh: 'sh', bash: 'sh', shell: 'sh', zsh: 'sh', console: 'sh', termux: 'sh',
+    sql: 'sql', json: 'json', jsonc: 'json', html: 'html', xml: 'html', svg: 'html', css: 'css', scss: 'css', yaml: 'yaml', yml: 'yaml', toml: 'yaml',
+    c: 'c', h: 'c', cpp: 'c', 'c++': 'c', cs: 'c', csharp: 'c', java: 'c', kotlin: 'c', kt: 'c', go: 'c', golang: 'c', rust: 'c', rs: 'c', swift: 'c', php: 'c', rb: 'c', ruby: 'c', dart: 'c', lua: 'c', scala: 'c',
+    diff: 'diff', patch: 'diff',
+  };
+
+  function highlight(code, lang) {
+    const fam = FAMILY[String(lang || '').toLowerCase()];
+    if (!fam || code.length > 30000) return esc(code);
+    if (fam === 'diff') {
+      return code.split('\n').map((l) => {
+        const cls = l.startsWith('@@') ? 'tk-hunk' : l.startsWith('+') ? 'tk-add' : l.startsWith('-') ? 'tk-del' : '';
+        return cls ? `<span class="${cls}">${esc(l)}</span>` : esc(l);
+      }).join('\n');
+    }
+    const rules = RULES[fam];
+    let i = 0, out = '';
+    while (i < code.length) {
+      let hit = null;
+      for (const [cls, re] of rules) {
+        re.lastIndex = i;
+        const m = re.exec(code);
+        if (m && m[0]) { hit = [cls, m[0]]; break; }
+      }
+      if (hit) { out += hit[0] ? `<span class="tk-${hit[0]}">${esc(hit[1])}</span>` : esc(hit[1]); i += hit[1].length; }
+      else { out += esc(code[i]); i++; }
+    }
+    return out;
+  }
 
   // ── Markdown (минимальный, безопасный: всё экранируется) ───────────────
   function inline(s, codes) {
@@ -80,13 +148,22 @@
 
     let html = out.join('').replace(/\u0000C(\d+)\u0000/g, (_, i) => {
       const f = fences[i];
-      return `<div class="code"><div class="code-h"><span>${esc(f.lang || 'код')}</span><button class="copy" data-act="copycode">Копировать</button></div><pre><code>${esc(f.code)}</code></pre></div>`;
+      return `<div class="code"><div class="code-h"><span>${esc(f.lang || 'код')}</span><button class="copy" data-act="copycode">Копировать</button></div><pre><code>${highlight(f.code, f.lang)}</code></pre></div>`;
     });
     if (caret) html = /<\/(p|li|h\d|blockquote)>$/.test(html) ? html.replace(/(<\/(p|li|h\d|blockquote)>)$/, '<span class="caret"></span>$1') : `${html}<span class="caret"></span>`;
     return html;
   }
 
   // ── Сообщения ────────────────────────────────────────────────────────────
+  // Из истории: «[пользователь прислал картинку] текст\n\n📎 имя:\n```…```» → текст + плашки вложений.
+  function parseUserText(content) {
+    let text = String(content);
+    const attach = { image: false, files: [] };
+    if (text.startsWith('[пользователь прислал картинку]')) { attach.image = true; text = text.replace(/^\[пользователь прислал картинку\]\s*/, ''); }
+    text = text.replace(/\n*📎 ([^\n]*?):\n```\n[\s\S]*?\n```/g, (_, name) => { attach.files.push(name); return ''; }).trim();
+    return { text, attach: attach.image || attach.files.length ? attach : null };
+  }
+
   const lastAssistant = () => { for (let i = S.messages.length - 1; i >= 0; i--) if (S.messages[i].role === 'assistant') return S.messages[i]; return null; };
 
   function addMessage(m) {
@@ -132,12 +209,30 @@
 
   // Кнопки под сообщением бота — как inline-клавиатура в Telegram.
   function actionsHtml(m) {
-    if (!m.done || m.typing || m.error || !m.text) return '';
+    if (!m.done || m.typing || m.error || !(m.text || m.image || (m.files && m.files.length))) return '';
     const last = m === lastAssistant();
     const rows = [];
-    if (last && S.hasLast && !S.busy) rows.push('<div class="kbrow"><button class="kbtn" data-act="again">🔄 Заново</button><button class="kbtn" data-act="short">✂️ Короче</button><button class="kbtn" data-act="long">➕ Подробнее</button></div>');
-    rows.push('<div class="kbrow"><button class="kbtn" data-act="copy">📋 Копировать</button></div>');
+    if (last && S.hasLast && !S.busy && m.text) rows.push('<div class="kbrow"><button class="kbtn" data-act="again">🔄 Заново</button><button class="kbtn" data-act="short">✂️ Короче</button><button class="kbtn" data-act="long">➕ Подробнее</button></div>');
+    if (m.text) rows.push('<div class="kbrow"><button class="kbtn" data-act="copy">📋 Копировать</button></div>');
+    if (!rows.length) return '';
     return `<div class="kb">${rows.join('')}</div>`;
+  }
+
+  const kbSize = (n) => (n < 1024 ? `${n} Б` : `${(n / 1024).toFixed(1)} КБ`);
+
+  // Картинка (или заглушка, пока рисуется) и карточки файлов под текстом ответа.
+  function extrasHtml(m) {
+    const parts = [];
+    const drawing = !m.done && !m.image && m.trace.some((x) => x.k === 'tool' && (x.name === 'generate_image' || x.name === 'edit_image'));
+    if (m.image || drawing) {
+      if (m.imgData) parts.push(`<div class="genimg"><img src="${m.imgData}" alt="Картинка" data-act="imgview"><div class="gen-act"><button class="mini" data-act="imgchat">📤 В чат</button><button class="mini" data-act="imgdoc">📎 Файлом</button></div></div>`);
+      else if (m.imgErr) parts.push('<div class="muted">Картинка уже недоступна — попросите нарисовать заново.</div>');
+      else parts.push('<div class="gen-ph"><span class="spin"></span> Рисую…</div>');
+    }
+    (m.files || []).forEach((f, i) => {
+      parts.push(`<div class="filecard"><div class="fi">📄</div><div class="fm"><b>${esc(f.name)}</b><span>${kbSize(f.size)} · ${f.sent ? 'отправлен вам в чат ✓' : 'в чат отправить не вышло'}</span></div>${f.text != null ? `<div class="acts"><button class="mini" data-act="fcopy" data-i="${i}">Копировать</button><button class="mini" data-act="fdl" data-i="${i}">Скачать</button></div>` : ''}</div>`);
+    });
+    return parts.join('');
   }
 
   function msgEl(m) {
@@ -147,11 +242,13 @@
     root.className = `msg ${m.role}`;
     root.dataset.id = m.id;
     if (m.role === 'user') {
-      root.innerHTML = `<div class="bubble me">${esc(m.text)}${m.at ? `<span class="stamp">${hhmm(m.at)}</span>` : ''}</div>`;
+      const a = m.attach;
+      const att = a ? `${a.image ? (typeof a.image === 'string' ? `<img class="att-img" src="${a.image}" alt="">` : '<div class="att-file">🖼 Картинка</div>') : ''}${(a.files || []).map((n) => `<div class="att-file">📎 ${esc(n)}</div>`).join('')}` : '';
+      root.innerHTML = `<div class="bubble me">${att}${m.text ? `<div>${esc(m.text)}</div>` : ''}${m.at ? `<span class="stamp">${hhmm(m.at)}</span>` : ''}</div>`;
       e = { root };
     } else {
-      root.innerHTML = '<div class="bubble bot"><div class="a-body"></div><div class="think"></div><div class="stamp"></div></div><div class="kb-w"></div>';
-      e = { root, bubble: root.querySelector('.bubble'), body: root.querySelector('.a-body'), think: root.querySelector('.think'), stamp: root.querySelector('.stamp'), actions: root.querySelector('.kb-w'), cache: {} };
+      root.innerHTML = '<div class="bubble bot"><div class="a-body"></div><div class="extras"></div><div class="think"></div><div class="stamp"></div></div><div class="kb-w"></div>';
+      e = { root, bubble: root.querySelector('.bubble'), body: root.querySelector('.a-body'), extras: root.querySelector('.extras'), think: root.querySelector('.think'), stamp: root.querySelector('.stamp'), actions: root.querySelector('.kb-w'), cache: {} };
     }
     els.set(m.id, e);
     listEl.appendChild(root);
@@ -176,8 +273,10 @@
     if (m.error) body = `<div class="a-error"><span>⚠️ ${esc(m.error)}</span><button data-act="retry">Повторить</button></div>`;
     else if (shown) body = md(shown, m.typing || !m.done);
     else if (!m.done) body = '<span class="typing" aria-label="печатает"><i></i><i></i><i></i></span>';   // мигающие точки, пока ответа ещё нет
-    e.bubble.classList.toggle('hidden', !body && !m.error);
+    const extras = m.role === 'assistant' ? extrasHtml(m) : '';
+    e.bubble.classList.toggle('hidden', !body && !m.error && !extras);
     setHtml(e, 'body', e.body, body);
+    setHtml(e, 'extras', e.extras, extras);
     if (m.at && m.done && !m.typing && !m.error) setHtml(e, 'stamp', e.stamp, hhmm(m.at + (m.ms || 0)));
     setHtml(e, 'think', e.think, m.restored || (m.error && !m.trace.length) ? '' : thinkHtml(m));
     setHtml(e, 'actions', e.actions, actionsHtml(m));
@@ -244,6 +343,14 @@
     }
     m.trace = (r.trace || []).map((x) => ({ ...x }));
     m.live = r.live || '';
+    m.files = r.files || [];
+    if (r.image) {
+      m.image = r.image;
+      if (!m.imgData && !m.imgLoading) {
+        m.imgLoading = true;
+        rpc('image', { runId: r.image.id }).then((res) => { m.imgData = res.dataUrl; renderMsg(m); toBottom(true); }).catch(() => { m.imgErr = true; renderMsg(m); });
+      }
+    }
     if (r.done) { m.done = true; m.ms = r.ms; m.error = r.error || null; if (m.error) m.typing = false; }
     if (m.text && !m.error) m.typing = true;
     renderMsg(m);
@@ -265,9 +372,9 @@
     }
   }
 
-  async function ask({ text, mode = null, regen = false, again = false }) {
+  async function ask({ text, mode = null, regen = false, again = false, images = [], files = [] }) {
     if (S.busy) return;
-    if (!regen && !mode && !again && !text.trim()) return;
+    if (!regen && !mode && !again && !text.trim() && !images.length && !files.length) return;
     S.busy = true;
     stick = true;
     haptic('light');
@@ -276,7 +383,10 @@
       const prev = lastAssistant();
       if (prev) S.messages.splice(S.messages.indexOf(prev), 1);
     }
-    if (!regen && !mode && !again) addMessage({ role: 'user', text: text.trim(), at: Date.now() });
+    if (!regen && !mode && !again) {
+      const attach = images.length || files.length ? { image: images[0] || false, files: files.map((f) => f.name) } : null;
+      addMessage({ role: 'user', text: text.trim(), at: Date.now(), attach });
+    }
     const m = addMessage({ role: 'assistant', text: '', shown: 0, trace: [], live: '', done: false, typing: false, open: false, openTools: new Set(), t0: Date.now(), at: Date.now(), ms: null, error: null });
     renderAll();
     toBottom(true);
@@ -285,7 +395,7 @@
 
     const poller = follow(m, runId, () => finished);
     try {
-      const res = await rpc('send', { text, mode, regen: regen || undefined, runId });
+      const res = await rpc('send', { text, mode, regen: regen || undefined, runId, images, files: files.map((f) => ({ name: f.name, text: f.text })) });
       finished = true;
       applyRun(m, res);
       S.hasLast = true;
@@ -310,11 +420,14 @@
 
   async function sendFromInput() {
     const text = inputEl.value.trim();
-    if (!text || S.busy) return;
+    const { image, files } = S.pending;
+    if ((!text && !image && !files.length) || S.busy) return;
     inputEl.value = '';
+    S.pending = { image: null, files: [] };
+    renderTray();
     autosize();
     updateComposer();
-    await ask({ text });
+    await ask({ text, images: image ? [image.dataUrl] : [], files });
   }
 
   // ── Ввод ─────────────────────────────────────────────────────────────────
@@ -323,7 +436,7 @@
     inputEl.style.height = `${Math.min(inputEl.scrollHeight, 156)}px`;
   }
   function updateComposer() {
-    sendEl.disabled = S.busy || !inputEl.value.trim();
+    sendEl.disabled = S.busy || !(inputEl.value.trim() || S.pending.image || S.pending.files.length);
     sendEl.classList.toggle('busy', S.busy);
     statusEl.textContent = S.busy ? 'печатает…' : 'в сети';
     statusEl.classList.toggle('typing-now', S.busy);
@@ -333,6 +446,91 @@
     if (e.key === 'Enter' && !e.shiftKey && window.matchMedia('(pointer:fine)').matches) { e.preventDefault(); sendFromInput(); }
   });
   sendEl.addEventListener('click', sendFromInput);
+
+  // ── Вложения ─────────────────────────────────────────────────────────────
+  const TEXT_EXT = /\.(txt|md|markdown|json|jsonl|csv|tsv|log|js|mjs|cjs|jsx|ts|tsx|py|rb|php|java|kt|c|h|cpp|hpp|cs|go|rs|swift|sh|bash|zsh|sql|html|htm|css|scss|xml|yml|yaml|toml|ini|cfg|conf|env|lua|dart|vue|svelte)$/i;
+
+  const readText = (file) => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(r.error);
+    r.readAsText(file);
+  });
+
+  // Картинку уменьшаем и сжимаем в JPEG: передача идёт одним запросом, тяжёлые фото не пролезут.
+  function shrinkImage(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        let max = 1280, q = 0.8, data = '';
+        for (let i = 0; i < 4; i++) {
+          const k = Math.min(1, max / Math.max(img.width, img.height));
+          const c = document.createElement('canvas');
+          c.width = Math.max(1, Math.round(img.width * k)); c.height = Math.max(1, Math.round(img.height * k));
+          const g = c.getContext('2d');
+          g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+          data = c.toDataURL('image/jpeg', q);
+          if (data.length < 900000) break;
+          max = Math.round(max * 0.75); q = Math.max(0.55, q - 0.1);
+        }
+        URL.revokeObjectURL(url);
+        resolve(data);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('bad image')); };
+      img.src = url;
+    });
+  }
+
+  async function addFiles(list) {
+    for (const f of Array.from(list || [])) {
+      try {
+        if (f.type.startsWith('image/')) {
+          S.pending.image = { dataUrl: await shrinkImage(f), name: f.name || 'photo.jpg' };
+        } else if (f.type.startsWith('text/') || f.type === 'application/json' || TEXT_EXT.test(f.name)) {
+          if (f.size > 400000) { toast(`«${f.name}» больше 400 КБ`); continue; }
+          if (S.pending.files.length >= 3) { toast('Не больше 3 файлов за раз'); continue; }
+          const text = await readText(f);
+          if (!text.trim()) { toast(`«${f.name}» пустой`); continue; }
+          S.pending.files.push({ name: f.name, text: text.slice(0, 60000) });
+          if (text.length > 60000) toast(`«${f.name}»: прочитаю первые 60 000 символов`);
+        } else {
+          toast('Такой формат пока не читаю: подойдут фото, текст и код');
+        }
+      } catch (e) { toast(`Не удалось открыть «${f.name}»`); }
+    }
+    renderTray();
+    updateComposer();
+  }
+
+  function renderTray() {
+    const { image, files } = S.pending;
+    const items = [];
+    if (image) items.push(`<div class="att"><img src="${image.dataUrl}" alt=""><span>Фото</span><button class="rm" data-rm="img" aria-label="Убрать">×</button></div>`);
+    files.forEach((f, i) => items.push(`<div class="att">📎 <span>${esc(f.name)}</span><button class="rm" data-rm="${i}" aria-label="Убрать">×</button></div>`));
+    trayEl.innerHTML = items.join('');
+    trayEl.classList.toggle('hidden', !items.length);
+  }
+  trayEl.addEventListener('click', (ev) => {
+    const rm = ev.target.closest('[data-rm]');
+    if (!rm) return;
+    if (rm.dataset.rm === 'img') S.pending.image = null; else S.pending.files.splice(Number(rm.dataset.rm), 1);
+    renderTray(); updateComposer();
+  });
+  attachEl.addEventListener('click', () => { haptic('light'); fileEl.click(); });
+  fileEl.addEventListener('change', async () => { const list = Array.from(fileEl.files || []); fileEl.value = ''; await addFiles(list); });
+  inputEl.addEventListener('paste', (ev) => {   // фото из буфера обмена
+    const files = Array.from((ev.clipboardData && ev.clipboardData.files) || []);
+    if (files.length) { ev.preventDefault(); addFiles(files); }
+  });
+
+  function download(name, text) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+    a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+  }
 
   // ── Копирование ──────────────────────────────────────────────────────────
   async function copy(text) {
@@ -360,6 +558,14 @@
       case 'think': if (m) { m.open = !m.open; haptic('light'); renderMsg(m); } break;
       case 'tool': if (m) { const id = btn.dataset.id; m.openTools.has(id) ? m.openTools.delete(id) : m.openTools.add(id); renderMsg(m); } break;
       case 'copy': if (m) copy(m.text); break;
+      case 'imgview': if (m && m.imgData) openSheet(`<img class="bigimg" src="${m.imgData}" alt="">`); break;
+      case 'imgchat': case 'imgdoc':
+        rpc('deliver', { as: btn.dataset.act === 'imgdoc' ? 'document' : 'photo' }).then(() => toast(btn.dataset.act === 'imgdoc' ? 'Отправил файлом в чат' : 'Отправил в чат')).catch((e) => toast(e.message || 'Не получилось'));
+        break;
+      case 'fcopy': if (m && m.files && m.files[btn.dataset.i]) copy(m.files[btn.dataset.i].text); break;
+      case 'fdl':
+        if (m && m.files && m.files[btn.dataset.i]) { const f = m.files[btn.dataset.i]; download(f.name, f.text); toast('Если файл не скачался — он уже у вас в чате с ботом'); }
+        break;
       case 'copycode': copy(btn.closest('.code').querySelector('code').textContent); break;
       case 'again': ask({ regen: true, text: '' }); break;
       case 'short': ask({ mode: 'short', text: '' }); break;
@@ -457,7 +663,14 @@
   window.addEventListener('resize', fitViewport);
 
   // ── Старт ────────────────────────────────────────────────────────────────
+  function applyTheme() {
+    const dark = tg && tg.colorScheme ? tg.colorScheme === 'dark' : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  }
+
   async function init() {
+    applyTheme();
+    if (tg && tg.onEvent) tg.onEvent('themeChanged', applyTheme);
     if (tg) {
       try {
         tg.ready(); tg.expand();
@@ -473,7 +686,7 @@
       Object.assign(S, { name: st.name, owner: st.owner, configured: st.configured, model: st.model, depth: st.depth, github: st.github, facts: st.facts, hasLast: st.hasLast });
       S.messages = [];
       for (const h of st.history) addMessage(h.role === 'user'
-        ? { role: 'user', text: h.content }
+        ? { role: 'user', ...parseUserText(h.content) }
         : { role: 'assistant', text: h.content, shown: h.content.length, trace: [], live: '', done: true, typing: false, open: false, openTools: new Set(), t0: 0, ms: null, error: null, restored: true });
       paintDepth();
       listEl.innerHTML = ''; els.clear();

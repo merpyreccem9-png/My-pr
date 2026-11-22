@@ -22,6 +22,8 @@ import pollEp from '../tgcloud/endpoints/poll.js';
 import setDepthEp from '../tgcloud/endpoints/setDepth.js';
 import githubEp from '../tgcloud/endpoints/github.js';
 import resetChatEp from '../tgcloud/endpoints/resetChat.js';
+import imageEp from '../tgcloud/endpoints/image.js';
+import deliverEp from '../tgcloud/endpoints/deliver.js';
 
 const U = (id, name = 'User', extra = {}) => ({ id, first_name: `${name}`, is_bot: false, ...extra });
 const ADMIN = U(1, 'Админ');
@@ -764,7 +766,7 @@ test('по умолчанию: gpt-6-luna, reasoning_effort xhigh, без temper
   assert.equal(body.max_output_tokens, undefined);   // владелец без лимита на ответ
   assert.equal(body.temperature, undefined);
   assert.equal(body.input[0].role, 'developer');
-  assert.deepEqual(body.tools.map((t) => t.name), ['generate_image']);   // без картинки править нечего
+  assert.deepEqual(body.tools.map((t) => t.name), ['generate_image', 'create_file']);   // без картинки править нечего
   assert.equal(body.tools[0].type, 'function');
 });
 
@@ -835,7 +837,7 @@ test('фото с подписью: модель видит картинку, ed
   assert.deepEqual(content[0], { type: 'input_text', text: 'добавь ему красную шляпу' });
   assert.equal(content[1].type, 'input_image');
   assert.equal(content[1].image_url, `data:image/jpeg;base64,${b64(JPG)}`);
-  assert.deepEqual(chatBody.tools.map((t) => t.name), ['generate_image', 'edit_image']);
+  assert.deepEqual(chatBody.tools.map((t) => t.name), ['generate_image', 'edit_image', 'create_file']);
 
   const edit = fetchCalls.find((c) => c.url.endsWith('/images/edits'));
   assert.equal(edit.init.headers['Content-Type'], undefined);          // boundary выставит платформа
@@ -1022,7 +1024,7 @@ test('/responses недоступен или не знает reasoning → за�
     await send(pmsg(OWNER, 'alo'));
     const b = JSON.parse(fetchCalls[1].init.body);
     assert.equal(b.reasoning_effort, 'none');
-    assert.deepEqual(b.tools.map((t) => t.function.name), ['generate_image']);
+    assert.deepEqual(b.tools.map((t) => t.function.name), ['generate_image', 'create_file']);
     assert.equal(lastText(), 'Привет!');
   }
 });
@@ -1811,4 +1813,99 @@ test('/setapp: кнопка Mini App в меню бота и на главном
   assert.deepEqual(calls('setChatMenuButton').at(-1).menu_button, { type: 'web_app', text: 'Luna', web_app: { url: 'https://app42.example.com/' } });
   await send(pmsg(OWNER, '/menu'));
   assert.deepEqual(calls('sendMessage').at(-1).reply_markup.inline_keyboard[0], [{ text: '📱 Открыть Luna', web_app: { url: 'https://app42.example.com/' } }]);
+});
+
+// ── Вложения, картинки и файлы в Mini App; файлы в боте ─────────────────────
+
+const JPEG_URL = `data:image/jpeg;base64,${b64(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]))}`;
+
+test('Mini App send: картинка и текстовый файл доходят до модели; кривые вложения отбрасываются', async () => {
+  await sendKeyOnly();
+  aiReply('Вижу кота и скрипт.');
+  await ep(sendEp, {
+    text: 'что тут?', runId: 'at1',
+    images: [JPEG_URL, 'data:text/html;base64,AAAA', 42],
+    files: [{ name: 'a.py', text: 'print("hi")' }, { name: 'пусто.txt', text: '   ' }],
+  });
+  const raw = fetchCalls.at(-1).init.body;
+  assert.ok(raw.includes(JPEG_URL));                                   // картинка ушла модели
+  assert.equal((raw.match(/data:image/g) ?? []).length, 1);            // лишнее отброшено
+  assert.ok(raw.includes('a.py') && raw.includes('print(\\"hi\\")')); // содержимое файла — блоком кода
+  assert.ok(!raw.includes('пусто.txt'));
+  const h = dump('history');
+  assert.match(h[0].content, /^\[пользователь прислал картинку\] что тут\?\n\n📎 a\.py:\n```\nprint\("hi"\)\n```$/);
+
+  aiReply('Файл прочитал.');
+  await ep(sendEp, { text: '', runId: 'at2', files: [{ name: 'b.txt', text: 'abc' }] });   // без текста — вопрос по умолчанию
+  assert.match(userTextOf(lastBody()), /^Посмотри файл и коротко расскажи/);
+});
+
+test('Mini App send: «нарисуй» → картинка сохраняется для клиента, image отдаёт её, deliver шлёт в чат', async () => {
+  await sendKeyOnly();
+  let n = 0;
+  mockFetch(async (url) => {
+    if (url.endsWith('/responses')) {
+      n++;
+      return jsonResponse({ output: [
+        { type: 'function_call', name: 'generate_image', arguments: JSON.stringify({ prompt: 'a cat', size: '1024x1024' }), call_id: 'g1' },
+        { type: 'message', content: [{ type: 'output_text', text: 'Держи кота' }] },
+      ], usage: { input_tokens: 5, output_tokens: 3 } });
+    }
+    assert.ok(url.endsWith('/images/generations'));
+    return jsonResponse({ data: [{ b64_json: b64(PNG) }] });
+  });
+  const res = await ep(sendEp, { text: 'нарисуй кота', runId: 'im1' });
+  assert.equal(n, 1);
+  assert.equal(res.text, 'Держи кота');
+  assert.deepEqual(res.image, { id: 'im1', mime: 'image/png', kb: 0 });
+  assert.equal(res.trace.at(-1).name, 'generate_image');
+  assert.equal(res.trace.at(-1).state, 'ok');
+  assert.deepEqual(dump('history').map((h) => h.content), ['нарисуй кота', 'Держи кота\n[нарисовал картинку: a cat]']);
+
+  const img = await ep(imageEp, { runId: 'im1' });
+  assert.equal(img.dataUrl, `data:image/png;base64,${b64(PNG)}`);
+  await assert.rejects(() => ep(imageEp, { runId: 'чужой' }), (e) => e.parameters.code === 'GONE');
+
+  await ep(deliverEp, { as: 'photo' });
+  assert.deepEqual(calls('sendPhoto').at(-1).photo.bytes, PNG);
+  await ep(deliverEp, { as: 'document' });
+  assert.deepEqual(calls('sendDocument').at(-1).document.bytes, PNG);
+  assert.equal(calls('sendDocument').at(-1).chat_id, OWNER.id);
+});
+
+test('Mini App send: create_file → документ уходит в чат, приложению отдаётся карточка файла', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => jsonResponse({ output: [
+    { type: 'function_call', name: 'create_file', arguments: JSON.stringify({ filename: '../evil/hello', content: 'print("привет")\n' }), call_id: 'f1' },
+    { type: 'message', content: [{ type: 'output_text', text: 'Готово, файл ниже.' }] },
+  ], usage: { input_tokens: 5, output_tokens: 3 } }));
+  const res = await ep(sendEp, { text: 'сделай файл hello', runId: 'fl1' });
+
+  const doc = calls('sendDocument').at(-1);
+  assert.equal(doc.chat_id, OWNER.id);
+  assert.equal(doc.document.name, '_evil_hello.txt');                   // путь вычищен, расширение добавлено
+  assert.equal(new TextDecoder().decode(doc.document.bytes), 'print("привет")\n');
+  assert.deepEqual(res.files, [{ name: '_evil_hello.txt', size: 22, sent: true, text: 'print("привет")\n' }]);
+  assert.equal(res.trace.at(-1).name, 'create_file');
+  assert.match(dump('history').at(-1).content, /\[отправил файл _evil_hello\.txt\]/);
+});
+
+test('бот: create_file → файл приходит документом, подпись — обычным сообщением', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => jsonResponse({ output: [
+    { type: 'function_call', name: 'create_file', arguments: JSON.stringify({ filename: 'notes.md', content: '# Заметки\n- раз' }), call_id: 'f2' },
+    { type: 'message', content: [{ type: 'output_text', text: 'Вот файл с заметками.' }] },
+  ] }));
+  await send(pmsg(OWNER, 'сделай файл notes.md с заметками'));
+  assert.equal(lastText(), 'Вот файл с заметками.');
+  const doc = calls('sendDocument').at(-1);
+  assert.equal(doc.document.name, 'notes.md');
+  assert.equal(new TextDecoder().decode(doc.document.bytes), '# Заметки\n- раз');
+});
+
+test('код в ответе бота: блок с языком уходит в Telegram с подсветкой', async () => {
+  await sendKeyOnly();
+  aiReply('Вот пример:\n```python\nprint(1 < 2)\n```');
+  await send(pmsg(OWNER, 'покажи код'));
+  assert.equal(lastText(), 'Вот пример:\n<pre><code class="language-python">print(1 &lt; 2)</code></pre>');
 });

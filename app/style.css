@@ -1,5 +1,7 @@
 /* Luna — Mini App в духе Telegram: пузыри, «печатает…», кнопки под сообщением как inline-клавиатура. */
 :root {
+  --code-bg: #f6f8fa; --code-fg: #24292f;
+  --tk-k: #8250df; --tk-s: #0a7d54; --tk-n: #b35900; --tk-c: #6e7781; --tk-f: #0969da; --tk-t: #0e7490; --tk-l: #b4343c; --tk-p: #0550ae; --tk-g: #116329; --tk-v: #953800; --tk-add: rgba(46,160,67,.18); --tk-del: rgba(248,81,73,.18);
   --bg: var(--tg-theme-bg-color, #ffffff);
   --fg: var(--tg-theme-text-color, #111111);
   --hint: var(--tg-theme-hint-color, #8a8a8e);
@@ -62,7 +64,7 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .a-body blockquote { margin: 0 0 .6em; padding: 1px 0 1px 10px; border-left: 3px solid var(--accent); color: var(--hint); }
 .a-body a { color: var(--link); }
 .a-body code { font: 0.88em ui-monospace, "SF Mono", Menlo, Consolas, monospace; background: var(--soft); padding: 1px 5px; border-radius: 6px; }
-.code { margin: 0 0 .6em; border-radius: 12px; background: var(--card); overflow: hidden; }
+.code { margin: 0 0 .6em; border-radius: 12px; background: var(--code-bg); border: 1px solid var(--line); overflow: hidden; min-width: 0; }
 .code-h { display: flex; justify-content: space-between; align-items: center; padding: 5px 8px 5px 12px; font-size: 12px; color: var(--hint); border-bottom: 1px solid var(--line); }
 .code .copy { font-size: 12px; color: var(--accent); padding: 2px 6px; border-radius: 6px; }
 .code pre { margin: 0; padding: 9px 12px; overflow-x: auto; }
@@ -152,3 +154,41 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .facts { margin: 0; padding-left: 1.2em; font-size: 14.5px; }
 .facts li { margin: 3px 0; }
 .toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 76px); transform: translateX(-50%); background: color-mix(in srgb, var(--fg) 88%, transparent); color: var(--bg); padding: 9px 15px; border-radius: 12px; font-size: 14px; z-index: 20; max-width: 86vw; text-align: center; animation: fade .2s; }
+
+/* ── Цветной код ── */
+:root[data-theme="dark"] { --code-bg: #161b22; --code-fg: #e6edf3; --tk-k: #ff7b72; --tk-s: #a5d6ff; --tk-n: #79c0ff; --tk-c: #8b949e; --tk-f: #d2a8ff; --tk-t: #ffa657; --tk-l: #79c0ff; --tk-p: #79c0ff; --tk-g: #7ee787; --tk-v: #ffa657; --tk-add: rgba(46,160,67,.25); --tk-del: rgba(248,81,73,.25); }
+.code pre code { color: var(--code-fg); }
+.tk-k { color: var(--tk-k); } .tk-s { color: var(--tk-s); } .tk-n { color: var(--tk-n); } .tk-c { color: var(--tk-c); font-style: italic; }
+.tk-f { color: var(--tk-f); } .tk-t { color: var(--tk-t); } .tk-l { color: var(--tk-l); } .tk-p { color: var(--tk-p); } .tk-g { color: var(--tk-g); } .tk-v { color: var(--tk-v); }
+.tk-add { background: var(--tk-add); display: inline-block; width: 100%; } .tk-del { background: var(--tk-del); display: inline-block; width: 100%; } .tk-hunk { color: var(--tk-f); }
+.msg.assistant .bubble { max-width: 100%; }
+.a-body { min-width: 0; }
+
+/* ── Вложения: лоток над вводом ── */
+.clip { flex: none; width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; color: var(--hint); }
+.clip:active { background: var(--soft); }
+.tray { display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 8px; scrollbar-width: none; }
+.tray::-webkit-scrollbar { display: none; }
+.att { position: relative; flex: none; display: flex; align-items: center; gap: 6px; padding: 0 28px 0 10px; height: 54px; border-radius: 12px; background: var(--card); font-size: 13.5px; max-width: 220px; }
+.att img { width: 54px; height: 54px; object-fit: cover; border-radius: 12px; margin-left: -10px; }
+.att span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att .rm { position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border-radius: 50%; background: rgba(0, 0, 0, .5); color: #fff; font-size: 13px; line-height: 20px; text-align: center; }
+.att-img { display: block; max-width: 220px; max-height: 220px; border-radius: 12px; margin: 0 0 5px; object-fit: cover; }
+.att-file { display: inline-block; margin: 0 4px 5px 0; padding: 4px 9px; border-radius: 10px; background: rgba(255, 255, 255, .2); font-size: 13.5px; }
+
+/* ── Картинка и файл в ответе бота ── */
+.extras:empty { display: none; }
+.extras { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.genimg img { display: block; width: 100%; max-width: 420px; border-radius: 12px; cursor: zoom-in; background: var(--soft); min-height: 120px; object-fit: contain; }
+.gen-ph { display: flex; align-items: center; justify-content: center; gap: 10px; width: min(100%, 320px); aspect-ratio: 1; border-radius: 12px; color: var(--hint); background: linear-gradient(110deg, var(--soft) 30%, transparent 50%, var(--soft) 70%) 0 0 / 220% 100%; animation: shimmer 1.4s linear infinite; }
+@keyframes shimmer { to { background-position: -120% 0; } }
+.gen-act { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.mini { padding: 6px 11px; border-radius: 10px; background: var(--soft); color: var(--accent); font-size: 13.5px; font-weight: 500; }
+.mini:active { background: var(--line); }
+.filecard { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 12px; background: var(--card); }
+.filecard .fi { font-size: 26px; }
+.filecard .fm { flex: 1; min-width: 0; }
+.filecard .fm b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.filecard .fm span { font-size: 12.5px; color: var(--hint); }
+.filecard .acts { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.bigimg { display: block; width: 100%; border-radius: 12px; }

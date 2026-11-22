@@ -11,13 +11,26 @@ export function mention(u) {
   return `<a href="tg://user?id=${u.id}">${esc(fullName(u).slice(0, 40))}</a>`;
 }
 
+// Строка → байты UTF-8 (TextEncoder, а если его нет в среде — через encodeURIComponent).
+export function utf8Bytes(str) {
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str);
+  const bin = unescape(encodeURIComponent(str));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 // Упрощённый markdown (ответы ИИ) → HTML Telegram.
 export function mdToHtml(src) {
   const stash = [];
   const hold = (html) => `\u0000${stash.push(html) - 1}\u0000`;
 
   let s = src
-    .replace(/```[\w+-]*\n?([\s\S]*?)```/g, (_, code) => hold(`<pre>${esc(code.replace(/\n$/, ''))}</pre>`))
+    .replace(/```([\w+#.-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      const body = esc(code.replace(/\n$/, ''));
+      // Язык → Telegram сам подсвечивает код цветом (<code class="language-…">).
+      return hold(/^[\w+#.-]{1,20}$/.test(lang) ? `<pre><code class="language-${lang.toLowerCase()}">${body}</code></pre>` : `<pre>${body}</pre>`);
+    })
     .replace(/`([^`\n]+)`/g, (_, c) => hold(`<code>${esc(c)}</code>`));
 
   s = esc(s)

@@ -58,7 +58,8 @@ test('mdToHtml: жирный, код, блоки, заголовки, списк
   assert.equal(mdToHtml('**Привет** <мир> & `a<b`'), '<b>Привет</b> &lt;мир&gt; &amp; <code>a&lt;b</code>');
   assert.equal(mdToHtml('# Заголовок\n- один\n* два'), '<b>Заголовок</b>\n• один\n• два');
   assert.equal(mdToHtml('# **Жирный** заголовок'), '<b>Жирный заголовок</b>');
-  assert.equal(mdToHtml('```js\nif (a < b) {}\n```'), '<pre>if (a &lt; b) {}</pre>');
+  assert.equal(mdToHtml('```js\nif (a < b) {}\n```'), '<pre><code class="language-js">if (a &lt; b) {}</code></pre>');
+  assert.equal(mdToHtml('```\nplain\n```'), '<pre>plain</pre>');
   // звёздочки внутри кода не превращаются в теги
   assert.equal(mdToHtml('`**x**`'), '<code>**x**</code>');
   // незакрытый ``` остаётся текстом и не ломает HTML

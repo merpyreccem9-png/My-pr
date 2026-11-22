@@ -3,6 +3,7 @@
 
 import { api, fetch, FormData, InputFile, BotApiError } from 'sdk';
 import { AiError, setAiConfig } from './ai.js';
+import { utf8Bytes } from './fmt.js';
 import { AI_MAX_FILE_BYTES, AI_IMAGE_FALLBACKS, AI_STT_FALLBACKS } from './config.js';
 
 // ── base64 (btoa/atob в изолята может не быть — свой кодек) ─────────────────
@@ -236,4 +237,11 @@ export async function sendImage(msg, { bytes, mime }) {
   }
   const sent = await api.sendDocument({ ...params, document: file });   // слишком тяжёлая для фото
   return sent?.document?.file_id ?? null;
+}
+
+// Шлёт текстовый файл в чат документом (ответ ИИ «пришли файлом»). → file_id.
+export async function sendTextFile(chatId, { name, content }, extra = {}) {
+  const bytes = utf8Bytes(content);
+  const sent = await api.sendDocument({ chat_id: chatId, ...extra, document: new InputFile(bytes, name, { type: 'text/plain' }) });
+  return { size: bytes.length, fileId: sent?.document?.file_id ?? null };
 }

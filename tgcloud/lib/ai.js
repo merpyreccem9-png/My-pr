@@ -36,6 +36,7 @@ export function personaLabel(prompt) {
 const BASE_PROMPT = [
   'Ты — ИИ-ассистент в Telegram. Отвечай на языке пользователя, по делу и компактно (обычно до 1500 символов).',
   'Форматирование: только простой markdown — **жирный**, `код`, блоки кода, списки через «-». Без таблиц.',
+  'Любой код, команды и конфиги оформляй блоками ``` с указанием языка (```python, ```bash, ```js, ```json) — они показываются в рамке с цветной подсветкой. Не вставляй код в обычный текст.',
   'Ты отвечаешь в Telegram, а НЕ в приложении ChatGPT: формулы здесь не рисуются, LaTeX виден как мусор.',
   'ЗАПРЕЩЕНО: \\( \\), \\[ \\], $…$, $$…$$, \\frac, \\sqrt, \\boxed, \\log и любые команды с обратным слэшем.',
   'Математику пиши обычным текстом и символами Юникода: дроби через / (3/4), корень √ и ∛, степени x², 10⁻², индексы log₂, знаки × · ÷ ≤ ≥ ≠ ≈ π.',
@@ -154,6 +155,38 @@ const TOOL_EDIT = {
     },
   },
 };
+
+const TOOL_FILE = {
+  type: 'function',
+  function: {
+    name: 'create_file',
+    description: 'Создать ФАЙЛ и отправить его пользователю документом: код, скрипт, текст, markdown, csv, json, html и т.п. Вызывай, когда просят «пришли файлом», «сделай файл/документ», «сохрани в файл», или когда код/текст очень большой (больше ~60 строк).',
+    parameters: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', description: 'Имя файла с расширением, например app.py или notes.md.' },
+        content: { type: 'string', description: 'Полное содержимое файла (только текст).' },
+      },
+      required: ['filename', 'content'],
+    },
+  },
+};
+
+const FILE_PROMPT = 'Ты умеешь отправлять файлы через функцию create_file (один файл за вызов). Вместе с ней напиши короткое пояснение (1–2 фразы). Короткий код (до ~60 строк) показывай блоком в ответе, а не файлом.';
+
+const MAX_FILE_CHARS = 400_000;
+
+// Вызов create_file → { name, content } или null.
+function fileRequest(call) {
+  if (!call || call.name !== 'create_file') return null;
+  let args = {};
+  try { args = JSON.parse(call.arguments || '{}'); } catch { return null; }
+  const content = typeof args.content === 'string' ? args.content.slice(0, MAX_FILE_CHARS) : '';
+  if (!content.trim()) return null;
+  let name = String(args.filename ?? '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').replace(/^\.+/, '').trim().slice(0, 80) || 'file';
+  if (!/\.[A-Za-z0-9]{1,8}$/.test(name)) name += '.txt';
+  return { name, content };
+}
 
 const IMAGE_PROMPT = [
   'Ты умеешь рисовать и править картинки через функции generate_image и edit_image.',
@@ -448,10 +481,11 @@ const GITHUB_PROMPT = [
   'Репозиторий указывай как owner/name. Сначала найди нужное (список репозиториев, папка, поиск), потом читай файлы. Менять что-либо на GitHub ты не можешь — не обещай этого.',
 ].join(' ');
 
-export function buildSystemPrompt({ name, persona, facts: factList, canImage = false, summary = '', github = false }) {
+export function buildSystemPrompt({ name, persona, facts: factList, canImage = false, summary = '', github = false, canFile = false }) {
   const parts = [BASE_PROMPT];
   if (canImage) parts.push(IMAGE_PROMPT);
   if (github) parts.push(GITHUB_PROMPT);
+  if (canFile) parts.push(FILE_PROMPT);
   if (persona) parts.push(`Стиль общения: ${persona}`);
   if (name) parts.push(`Собеседника зовут ${name}.`);
   if (factList.length) parts.push(`Что известно о собеседнике:\n${factList.map((f) => `- ${f}`).join('\n')}`);
@@ -504,13 +538,14 @@ async function foldIntoSummary(cfg, userId, stored, rows) {
  * images — data-URL картинок (модель их «видит»); canImage — разрешить рисование/правку через функции.
  * mode — 'short' (легче модель/effort, «ответь кратко») | 'long' (effort не ниже high, «ответь подробнее»);
  *   подсказка уходит модели, а в историю пишется исходный вопрос. replaceLast — заменить последний обмен (кнопки «Заново/Короче/Подробнее»).
+ * canFile — дать модели функцию create_file (файл-документ в ответ), результат — out.file {name, content}.
  * github — дать модели функции GitHub пользователя (только личка/Mini App, не группы); onTrace(entry, trace) — ход работы
  *   («мысли» и команды); thinkSummary — просить у модели краткое изложение мыслей.
  * onText(текст) — необязательный колбэк: включает потоковый режим и получает ответ по мере генерации (уже очищенный).
  * @returns {{ text: string, image: ?{kind,prompt,size}, commit: () => Promise<void> }}
  *   commit() сохраняет память — вызывайте ПОСЛЕ отправки ответа.
  */
-export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false, onText = null, mode = null, replaceLast = false, github = false, onTrace = null, thinkSummary = false }) {
+export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false, onText = null, mode = null, replaceLast = false, github = false, canFile = false, onTrace = null, thinkSummary = false }) {
   const base = await getAiConfig();
   if (!base) throw new AiError('not_configured');
 
@@ -548,11 +583,11 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
       ]
     : asked;
   const messages = [
-    { role: 'system', content: buildSystemPrompt({ name, persona, facts: factRows.map((f) => f.body), canImage, github: Boolean(ghToken), summary: useMemory ? stored[sumKey(userId)] ?? '' : '' }) },
+    { role: 'system', content: buildSystemPrompt({ name, persona, facts: factRows.map((f) => f.body), canImage, canFile, github: Boolean(ghToken), summary: useMemory ? stored[sumKey(userId)] ?? '' : '' }) },
     ...hist.slice().reverse().map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userContent },
   ];
-  const tools = [...(canImage ? [TOOL_GENERATE, ...(hasImage ? [TOOL_EDIT] : [])] : []), ...(ghToken ? GH_TOOLS : [])];
+  const tools = [...(canImage ? [TOOL_GENERATE, ...(hasImage ? [TOOL_EDIT] : [])] : []), ...(canFile ? [TOOL_FILE] : []), ...(ghToken ? GH_TOOLS : [])];
 
   // Ход работы: «мысли» и команды. Записи одной команды (по id) склеиваются: запуск → результат.
   const trace = [];
@@ -583,11 +618,12 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
   const { text, found } = extractMemory(content);
   const answer = deLatex(text || content);    // модель любит LaTeX, а Telegram его не рисует
   const image = imageRequest(call, hasImage);
+  const file = fileRequest(call);
 
   const commit = async () => {
     if (!useMemory) return;
     if (replaced.length) await db.delete(history).where(inArray(history.id, replaced.map((r) => r.id))).run();
-    const said = [answer, image ? `[${image.kind === 'edit' ? 'изменил' : 'нарисовал'} картинку: ${image.prompt.slice(0, 200)}]` : '']
+    const said = [answer, image ? `[${image.kind === 'edit' ? 'изменил' : 'нарисовал'} картинку: ${image.prompt.slice(0, 200)}]` : '', file ? `[отправил файл ${file.name}]` : '']
       .filter(Boolean).join('\n');
     await db.insert(history).values([
       { userId, role: 'user', content: `${hasImage ? '[пользователь прислал картинку] ' : ''}${question}`.trim() },
@@ -606,7 +642,7 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
     for (const f of found.slice(0, 1)) await addFact(userId, f, factRows);
   };
 
-  return { text: answer, image, usage: tokens, model: cfg.model, trace, commit };
+  return { text: answer, image, file, usage: tokens, model: cfg.model, trace, commit };
 }
 
 // ── Долговременная память ────────────────────────────────────────────────

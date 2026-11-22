@@ -11,7 +11,7 @@ import {
 } from './ai.js';
 import { logAi, statsText, logText, userText } from './stats.js';
 import {
-  pickMedia, loadImage, downloadFile, toDataUrl, transcribe, generateImage, editImage, sendImage,
+  pickMedia, loadImage, downloadFile, toDataUrl, transcribe, generateImage, editImage, sendImage, sendTextFile,
 } from './media.js';
 import { APP_URL_KEY, homeScreen, helpScreen, rpList, personaScreen, memScreen, depthScreen, githubScreen, answerKb } from './menu.js';
 import { ghWhoami, ghErrorText, setGhToken } from './github.js';
@@ -90,13 +90,18 @@ export async function chat(msg, user, input, { imageId = null, skipQuota = false
 
       const out = await askAi({
         userId: user.tgId, name: user.name, persona: user.persona, input, useMemory: user.aiMemory !== false,
-        images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true, onText, mode, replaceLast: replace,
+        images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true, canFile: true, onText, mode, replaceLast: replace,
         github: true,   // функции GitHub — только в личке (в группах чужие приватные репозитории светить нельзя)
         onTrace: async (e) => { if (e.k === 'tool' && e.state === 'run') await setStatus(`🐙 ${e.label}…`); },
       });
       await logAi({ from: msg.from, kind, input, model: out.model, usage: out.usage });   // токены уже потрачены
       // Финальная версия: убирает курсор, досылает хвост длинного ответа; под текстом — кнопки «Заново / Короче / Подробнее».
       await stream.finish(out.text, { markup: out.image ? null : answerKb() });
+      if (out.file) {
+        await setStatus('📄 Отправляю файл…');
+        await sendTextFile(msg.chat.id, out.file);
+        await logAi({ from: msg.from, kind: 'file', input: out.file.name, model: out.model });
+      }
       if (out.image) await produceImage(msg, user, out.image, src, { setStatus });
       else if (out.text) await kvSet(lastKey(user.tgId), JSON.stringify({ q: input.slice(0, 4000) }));
       await out.commit();
