@@ -2,6 +2,7 @@
 
 import { api, BotApiError } from 'sdk';
 import { esc, mdToHtml, chunk } from './fmt.js';
+import { AI_STREAM_INTERVAL_MS } from './config.js';
 
 export function baseParams(msg, reply = true) {
   const p = { chat_id: msg.chat.id, link_preview_options: { is_disabled: true } };
@@ -29,6 +30,95 @@ export async function sayMarkdown(msg, md, { reply = true } = {}) {
     }
     delete base.reply_parameters; // реплаем только первая часть
   }
+}
+
+const CURSOR = ' ▍';
+
+// Плавный вывод ответа ИИ: сообщение появляется с первыми словами и дописывается правками (editMessageText),
+// как печатает ChatGPT. push(текст) — «текст на данный момент» (не чаще раза в interval мс уходит правка);
+// finish(итог) — финальная версия без курсора, длинный ответ режется на несколько сообщений;
+// abort() — убрать курсор, если генерация оборвалась. Ничего не отправлено → finish работает как sayMarkdown.
+// Правки — украшение: сбой промежуточной правки (429, сообщение удалено) не ломает ответ, итог дойдёт в finish.
+export function streamReply(msg, { reply = false, interval = AI_STREAM_INTERVAL_MS } = {}) {
+  const base = baseParams(msg, reply);
+  const sent = [];            // по частям: { id, shown }
+  let latest = '';
+  let last = 0;
+  let backoffUntil = 0;
+  let closed = false;
+
+  async function put(i, md, cursor, strict = false) {
+    const tail = cursor ? CURSOR : '';
+    const html = mdToHtml(md) + tail;
+    const slot = sent[i];
+    if (slot && slot.shown === html) return;
+    const attempt = async (asHtml) => {
+      const text = asHtml ? html : md + tail;
+      const extra = asHtml ? { parse_mode: 'HTML' } : {};
+      if (!slot) {
+        const m = await api.sendMessage({ ...base, ...extra, text });
+        delete base.reply_parameters;
+        sent[i] = { id: m.message_id, shown: html };
+      } else {
+        await api.editMessageText({
+          chat_id: msg.chat.id, message_id: slot.id, link_preview_options: { is_disabled: true }, ...extra, text,
+        });
+        slot.shown = html;
+      }
+    };
+    try {
+      try {
+        await attempt(true);
+      } catch (e) {
+        if (!(e instanceof BotApiError) || notModified(e) || e.code !== 400) throw e;
+        await attempt(false);                       // разметка не прошла — обычным текстом
+      }
+    } catch (e) {
+      if (!(e instanceof BotApiError)) throw e;
+      if (notModified(e)) { if (slot) slot.shown = html; return; }
+      if (e.code === 429) backoffUntil = Date.now() + (Number(e.parameters?.retry_after) || 3) * 1000;
+      console.warn('stream put failed', e.code, e.description);
+      if (!strict) return;
+      if (!slot) throw e;
+      // Итог обязан дойти: правка не удалась — присылаем часть новым сообщением.
+      const m = await api.sendMessage({ ...base, text: md });
+      await quiet(api.deleteMessage({ chat_id: msg.chat.id, message_id: slot.id }));
+      sent[i] = { id: m.message_id, shown: html };
+    }
+  }
+
+  async function flush(text, cursor, strict = false) {
+    const parts = chunk(text);
+    for (let i = 0; i < parts.length; i++) await put(i, parts[i], cursor && i === parts.length - 1, strict);
+    return parts.length;
+  }
+
+  return {
+    async push(text) {
+      latest = text;
+      const now = Date.now();
+      if (closed || !text.trim() || now < backoffUntil || now - last < interval) return;
+      last = now;
+      await flush(text, true);
+    },
+
+    async finish(text) {
+      closed = true;
+      const final = String(text ?? '').trim();
+      if (!sent.length) {
+        if (final) await sayMarkdown(msg, final, { reply });
+        return;
+      }
+      const n = final ? await flush(final, false, true) : 0;
+      for (const s of sent.splice(n)) await quiet(api.deleteMessage({ chat_id: msg.chat.id, message_id: s.id }));
+    },
+
+    async abort() {
+      closed = true;
+      if (!sent.length || !latest.trim()) return;
+      try { await flush(latest, false); } catch (e) { console.warn('stream abort failed', e?.description ?? e); }
+    },
+  };
 }
 
 // Временное сообщение-статус («💭 Думаю…»): показываем на время работы и удаляем, когда функция завершилась

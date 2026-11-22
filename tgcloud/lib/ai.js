@@ -145,7 +145,83 @@ const usageOf = (u, inKey, outKey, detailsKey) => ({
   think: Number(u?.[detailsKey]?.reasoning_tokens) || 0,
 });
 
-async function completeChat(cfg, messages, tools, unlimited = false) {
+// ── Потоковый ответ (SSE) ────────────────────────────────────────────────
+
+const isSse = (res) => /text\/event-stream/i.test(res.headers?.get?.('content-type') ?? '');
+
+// UTF-8 → строка (TextDecoder, а если его нет в среде — через escape/decodeURIComponent).
+function utf8(bytes) {
+  if (typeof TextDecoder !== 'undefined') return new TextDecoder().decode(bytes);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return decodeURIComponent(escape(bin));
+}
+
+// Читает тело SSE и вызывает onEvent(объект) для каждой строки `data: {...}`.
+// Строки режем по байту \n до декодирования — многобайтовые символы не рвутся на границе чанков.
+async function readSse(res, onEvent) {
+  let buf = new Uint8Array(0);
+  const feed = async (bytes) => {
+    const line = utf8(bytes).replace(/\r$/, '');
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let ev;
+    try { ev = JSON.parse(payload); } catch { return; }
+    await onEvent(ev);
+  };
+  for await (const part of res.body) {
+    const next = new Uint8Array(buf.length + part.length);
+    next.set(buf); next.set(part, buf.length);
+    buf = next;
+    let nl;
+    while ((nl = buf.indexOf(10)) !== -1) {
+      const line = buf.subarray(0, nl);
+      buf = buf.subarray(nl + 1);
+      await feed(line);
+    }
+  }
+  if (buf.length) await feed(buf);
+}
+
+// /chat/completions со stream:true → тот же объект, что вернул бы обычный запрос.
+async function collectChatStream(res, onText) {
+  let content = '';
+  let usage = null;
+  const calls = [];
+  await readSse(res, async (ev) => {
+    if (ev.error) throw new AiError('http', JSON.stringify(ev.error).slice(0, 300));
+    if (ev.usage) usage = ev.usage;
+    const d = ev.choices?.[0]?.delta;
+    if (!d) return;
+    if (d.content) { content += d.content; await onText(content); }
+    for (const tc of d.tool_calls ?? []) {
+      const c = (calls[tc.index ?? 0] ??= { name: '', arguments: '' });
+      if (tc.function?.name) c.name += tc.function.name;
+      if (tc.function?.arguments) c.arguments += tc.function.arguments;
+    }
+  });
+  return { choices: [{ message: { content, tool_calls: calls.filter(Boolean).map((c) => ({ function: c })) } }], usage };
+}
+
+// /responses со stream:true: текст показываем по дельтам, а итог берём из финального события response.completed.
+async function collectResponsesStream(res, onText) {
+  let text = '';
+  let final = null;
+  await readSse(res, async (ev) => {
+    if (ev.type === 'response.output_text.delta' && ev.delta) { text += ev.delta; await onText(text); }
+    else if (ev.type === 'response.completed' || ev.type === 'response.incomplete') final = ev.response;
+    else if (ev.type === 'response.failed' || ev.type === 'error') {
+      throw new AiError('http', JSON.stringify(ev.response?.error ?? ev.error ?? ev).slice(0, 300));
+    }
+  });
+  if (!final) throw new AiError('bad_json', 'stream ended without response.completed');
+  return final;
+}
+
+const asAiError = (e) => (e instanceof AiError ? e : new AiError('http', `stream: ${String(e?.message ?? e).slice(0, 200)}`));
+
+async function completeChat(cfg, messages, tools, unlimited = false, onText = null) {
   const body = { model: cfg.model, messages };
   if (cfg.effort) {
     // Модели с рассуждением: max_completion_tokens (в него входят и токены «мысли»), temperature только без рассуждения.
@@ -158,23 +234,34 @@ async function completeChat(cfg, messages, tools, unlimited = false) {
     body.temperature = 0.7;
   }
   if (tools?.length) { body.tools = tools; body.tool_choice = 'auto'; }
+  if (onText) { body.stream = true; body.stream_options = { include_usage: true }; }
 
   const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
     body: JSON.stringify(body),
   });
-  const raw = await res.text();
+  const streaming = Boolean(onText) && res.ok && isSse(res);
+  const raw = streaming ? '' : await res.text();
   if (!res.ok) {
     // Модель без рассуждения (например, gpt-4o-mini) не знает reasoning_effort — повторяем обычным запросом.
     if (cfg.effort && res.status === 400 && /reasoning_effort|max_completion_tokens/i.test(raw)) {
       console.warn('model rejected reasoning params, retrying without them', cfg.model);
-      return completeChat({ ...cfg, effort: null }, messages, tools, unlimited);
+      return completeChat({ ...cfg, effort: null }, messages, tools, unlimited, onText);
+    }
+    // Провайдер не принял stream / stream_options — повторяем без потока.
+    if (onText && res.status === 400 && /stream/i.test(raw)) {
+      console.warn('stream rejected, retrying without streaming', cfg.model);
+      return completeChat(cfg, messages, tools, unlimited, null);
     }
     throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
   }
   let data;
-  try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
+  if (streaming) {
+    try { data = await collectChatStream(res, onText); } catch (e) { throw asAiError(e); }
+  } else {
+    try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
+  }
   const message = data?.choices?.[0]?.message;
   const content = message?.content ? String(message.content).trim() : '';
   const call = message?.tool_calls?.[0]?.function;
@@ -184,10 +271,10 @@ async function completeChat(cfg, messages, tools, unlimited = false) {
 
 // Модели с рассуждением не принимают функции в /chat/completions («Function tools with reasoning_effort are
 // not supported»), поэтому запрос с инструментами и effort идёт в /responses; остальное — в /chat/completions.
-async function complete(cfg, messages, tools, unlimited = false) {
+async function complete(cfg, messages, tools, unlimited = false, onText = null) {
   const reasoning = cfg.effort && cfg.effort !== 'none';
-  if (reasoning && tools?.length) return completeResponses(cfg, messages, tools, unlimited);
-  return completeChat(cfg, messages, tools, unlimited);
+  if (reasoning && tools?.length) return completeResponses(cfg, messages, tools, unlimited, onText);
+  return completeChat(cfg, messages, tools, unlimited, onText);
 }
 
 const toResponsesInput = (messages) => messages.map((m) => ({
@@ -203,7 +290,7 @@ const toResponsesTools = (tools) => tools.map((t) => ({
   type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters,
 }));
 
-async function completeResponses(cfg, messages, tools, unlimited) {
+async function completeResponses(cfg, messages, tools, unlimited, onText = null) {
   const body = {
     model: cfg.model,
     input: toResponsesInput(messages),
@@ -213,23 +300,34 @@ async function completeResponses(cfg, messages, tools, unlimited) {
     store: false,
   };
   if (!unlimited) body.max_output_tokens = AI_REASONING_MAX_TOKENS;   // «мысли» тоже входят в лимит
+  if (onText) body.stream = true;
 
   const res = await fetch(`${cfg.baseUrl}/responses`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
     body: JSON.stringify(body),
   });
-  const raw = await res.text();
+  const streaming = Boolean(onText) && res.ok && isSse(res);
+  const raw = streaming ? '' : await res.text();
   if (!res.ok) {
     // Провайдер без /responses или модель без рассуждения: обычный запрос с effort=none (функции там разрешены).
     if (res.status === 404 || res.status === 405 || (res.status === 400 && /reasoning/i.test(raw))) {
       console.warn('/responses not usable, falling back to chat/completions', res.status, cfg.model);
-      return completeChat({ ...cfg, effort: 'none' }, messages, tools, unlimited);
+      return completeChat({ ...cfg, effort: 'none' }, messages, tools, unlimited, onText);
+    }
+    // Потоковый режим недоступен (например, организация не подтверждена) — повторяем без потока.
+    if (onText && res.status === 400 && /stream/i.test(raw)) {
+      console.warn('stream rejected, retrying without streaming', cfg.model);
+      return completeResponses(cfg, messages, tools, unlimited, null);
     }
     throw new AiError('http', `${res.status} ${raw.slice(0, 300)}`);
   }
   let data;
-  try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
+  if (streaming) {
+    try { data = await collectResponsesStream(res, onText); } catch (e) { throw asAiError(e); }
+  } else {
+    try { data = JSON.parse(raw); } catch { throw new AiError('bad_json', raw.slice(0, 200)); }
+  }
   const out = Array.isArray(data?.output) ? data.output : [];
   const content = out
     .filter((o) => o.type === 'message')
@@ -272,13 +370,19 @@ export function extractMemory(reply) {
   return { text, found };
 }
 
+// Текст «на лету»: без недописанной строки [[remember: …]] и с той же чисткой LaTeX, что и у итогового ответа.
+const partialClean = (raw) => deLatex(
+  raw.replace(REMEMBER_RE, '').replace(/\[\[?(?:r[a-z]*:?[^\]]*)?$/i, ''),
+).trim();
+
 /**
  * Задать вопрос модели.
  * images — data-URL картинок (модель их «видит»); canImage — разрешить рисование/правку через функции.
+ * onText(текст) — необязательный колбэк: включает потоковый режим и получает ответ по мере генерации (уже очищенный).
  * @returns {{ text: string, image: ?{kind,prompt,size}, commit: () => Promise<void> }}
  *   commit() сохраняет память — вызывайте ПОСЛЕ отправки ответа.
  */
-export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false }) {
+export async function askAi({ userId, name, persona, input, useMemory = true, images = [], canImage = false, onText = null }) {
   const cfg = await getAiConfig();
   if (!cfg) throw new AiError('not_configured');
 
@@ -304,7 +408,19 @@ export async function askAi({ userId, name, persona, input, useMemory = true, im
   ];
   const tools = canImage ? [TOOL_GENERATE, ...(hasImage ? [TOOL_EDIT] : [])] : [];
 
-  const { content, call, usage: tokens } = await complete(cfg, messages, tools, !LIMITS.enabled || isOwner(userId));
+  // Чистим и отдаём текст не чаще раза в 400 мс: итог всё равно придёт целиком в конце.
+  let lastEmit = 0;
+  const emit = onText
+    ? async (raw) => {
+        const now = Date.now();
+        if (now - lastEmit < 400) return;
+        lastEmit = now;
+        const part = partialClean(raw);
+        if (part) await onText(part);
+      }
+    : null;
+
+  const { content, call, usage: tokens } = await complete(cfg, messages, tools, !LIMITS.enabled || isOwner(userId), emit);
   const { text, found } = extractMemory(content);
   const answer = deLatex(text || content);    // модель любит LaTeX, а Telegram его не рисует
   const image = imageRequest(call, hasImage);

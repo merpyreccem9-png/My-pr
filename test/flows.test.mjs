@@ -1365,3 +1365,123 @@ test('статус не критичен: удалить не вышло — о�
   await send(pmsg(OWNER, 'привет'));
   assert.equal(lastText(), 'Ответ дошёл');
 });
+
+// ── Плавный вывод ответа (стриминг) ──────────────────────────────────────
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// SSE-ответ: items — строки `data` (объекты → JSON) или { wait: мс } / { fail: 'текст' } для пауз и обрыва.
+const sseResponse = (items) => ({
+  ok: true,
+  status: 200,
+  headers: { get: (k) => (k.toLowerCase() === 'content-type' ? 'text/event-stream' : null) },
+  body: (async function* () {
+    const enc = new TextEncoder();
+    for (const it of items) {
+      if (it.wait) { await sleep(it.wait); continue; }
+      if (it.fail) throw new Error(it.fail);
+      yield enc.encode(`data: ${typeof it === 'string' ? it : JSON.stringify(it)}\n\n`);
+    }
+  })(),
+});
+const delta = (content) => ({ choices: [{ delta: { content } }] });
+
+test('стриминг (chat/completions): сообщение появляется с первых слов, дописывается правками, итог без курсора и без [[remember]]', async () => {
+  await setupAi();   // effort off → /chat/completions
+  mockFetch(async () => sseResponse([
+    delta('Привет'), { wait: 1150 }, delta(', **мир**'), { wait: 1150 }, delta('! [[remember: Зовут Оля'), delta(']]'),
+    { choices: [], usage: { prompt_tokens: 11, completion_tokens: 7 } }, '[DONE]',
+  ]));
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, 'привет'));
+
+  const body = JSON.parse(fetchCalls[0].init.body);
+  assert.equal(body.stream, true);
+  assert.deepEqual(body.stream_options, { include_usage: true });
+
+  const sends = calls('sendMessage');
+  assert.equal(sends[0].text, '💭 Думаю…');
+  assert.equal(sends[1].text, 'Привет ▍');                       // первое сообщение — с курсором
+  assert.equal(sends[1].parse_mode, 'HTML');
+  assert.equal(sends.length, 2);                                // одно сообщение, а не по куску на каждую правку
+
+  const streamMsgId = 5000 + apiCalls.findIndex((c) => c.method === 'sendMessage' && c.params.text === 'Привет ▍') + 1;
+  const edits = calls('editMessageText').filter((e) => e.message_id === streamMsgId);
+  assert.ok(edits.length >= 2, 'ожидаем промежуточную правку и финальную');
+  assert.match(edits[0].text, /^Привет, <b>мир<\/b>/);
+  assert.ok(edits[0].text.endsWith('▍'));
+  assert.equal(edits.at(-1).text, 'Привет, <b>мир</b>!');       // финал: без курсора, тег памяти вырезан
+  assert.ok(!edits.some((e) => /remember|\[\[/.test(e.text)));
+
+  assert.ok(calls('editMessageText').some((e) => e.text === '✍️ Пишу…'));   // статус сменился, когда пошёл текст
+  assert.equal(calls('deleteMessage').length, 1);                          // статус удалён
+  assert.deepEqual(dump('history').map((h) => h.content), ['привет', 'Привет, **мир**!']);
+  assert.deepEqual(dump('facts').map((f) => f.body), ['Зовут Оля']);
+});
+
+test('стриминг (/responses, по умолчанию Luna xhigh): дельты output_text, итог из response.completed', async () => {
+  await sendKeyOnly();
+  const full = 'Ответ по частям';
+  mockFetch(async () => sseResponse([
+    { type: 'response.created', response: {} },
+    { type: 'response.output_text.delta', delta: 'Ответ ' }, { wait: 1150 },
+    { type: 'response.output_text.delta', delta: 'по частям' },
+    { type: 'response.completed', response: {
+      output: [{ type: 'message', content: [{ type: 'output_text', text: full }] }],
+      usage: { input_tokens: 5, output_tokens: 3 },
+    } },
+  ]));
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, 'привет'));
+
+  assert.equal(fetchCalls[0].url, 'https://api.openai.com/v1/responses');
+  assert.equal(JSON.parse(fetchCalls[0].init.body).stream, true);
+  assert.equal(calls('sendMessage')[1].text, 'Ответ ▍');
+  assert.equal(calls('editMessageText').at(-1).text, full);
+  assert.deepEqual(dump('history').map((h) => h.content), ['привет', full]);
+});
+
+test('стриминг: поток оборвался на полуслове — курсор убран, владельцу показана ошибка', async () => {
+  await setupAi();
+  mockFetch(async () => sseResponse([delta('Начало ответа'), { wait: 1150 }, delta(' и ещё'), { fail: 'socket hang up' }]));
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, 'привет'));
+
+  const edits = calls('editMessageText');
+  assert.ok(edits.some((e) => e.text.includes('и ещё') && e.text.endsWith('▍')));
+  assert.equal(edits.at(-1).text.includes('▍'), false);   // курсор снят
+  assert.ok(edits.at(-1).text.startsWith('Начало ответа'));
+  assert.match(lastText(), /Ошибка ИИ \(http\)/);
+  assert.deepEqual(dump('history'), []);                  // оборванный ответ в память не попадает
+});
+
+test('стриминг: провайдер отверг stream (400) — тихий повтор обычным запросом, ответ доставлен', async () => {
+  await setupAi();
+  let n = 0;
+  mockFetch(async () => (n++ === 0
+    ? jsonResponse({ error: { message: "Unsupported parameter: 'stream_options'" } }, 400)
+    : jsonResponse({ choices: [{ message: { content: 'Без потока' } }] })));
+  await send(pmsg(OWNER, 'привет'));
+
+  assert.equal(fetchCalls.length, 2);
+  assert.equal(JSON.parse(fetchCalls[0].init.body).stream, true);
+  assert.equal(JSON.parse(fetchCalls[1].init.body).stream, undefined);
+  assert.equal(lastText(), 'Без потока');
+});
+
+test('стриминг: длинный ответ делится на сообщения, правка не прошла из-за разметки — уходит обычным текстом', async () => {
+  await setupAi();
+  const para = (i) => `Абзац ${i}: ${'текст '.repeat(150)}`;
+  const text = Array.from({ length: 6 }, (_, i) => para(i)).join('\n\n');
+  mockFetch(async () => sseResponse([delta(text.slice(0, 2000)), { wait: 1150 }, delta(text.slice(2000))]));
+  apiFail.set('editMessageText', { code: 400, description: "Bad Request: can't parse entities", times: 2 });   // 1-я правка — статус «Пишу…» (глотается), 2-я — текст
+  apiCalls.length = 0;
+  await send(pmsg(OWNER, 'привет'));
+
+  const parts = calls('sendMessage').slice(1);   // без статуса
+  assert.ok(parts.length >= 2, 'длинный ответ ушёл несколькими сообщениями');
+  assert.ok(parts.every((p) => p.text.length <= 4096));
+  const shown = calls('editMessageText').filter((e) => e.text !== '✍️ Пишу…' && e.text !== '💭 Думаю…');
+  assert.ok(shown.length >= 1);
+  assert.ok(!shown.at(-1).text.endsWith('▍'));            // финальная правка — без курсора
+  assert.ok(shown.some((e) => !e.parse_mode));            // одна правка ушла без parse_mode (запасной путь)
+});

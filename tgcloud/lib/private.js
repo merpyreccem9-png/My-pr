@@ -4,7 +4,7 @@ import { api, db } from 'sdk';
 import { users, chats, history } from '../schema.js';
 import { esc, maskKey } from './fmt.js';
 import { splitCommand, parseGender } from './parse.js';
-import { say, sayMarkdown, typing, withStatus } from './tg.js';
+import { say, sayMarkdown, streamReply, typing, withStatus } from './tg.js';
 import { touchUser, patchUser, botUsername, kvGetMany, kvSet } from './store.js';
 import {
   AiError, askAi, checkQuota, getAiConfig, setAiConfig, normEffort, addFact, forgetFact, clearHistory,
@@ -14,7 +14,7 @@ import {
   pickMedia, loadImage, downloadFile, toDataUrl, transcribe, generateImage, editImage, sendImage,
 } from './media.js';
 import { homeScreen, helpScreen, rpList, personaScreen, memScreen } from './menu.js';
-import { isOwner, AI_IMAGE_QUOTA_COST, AI_IMAGE_TTL, AI_MAX_AUDIO_SEC } from './config.js';
+import { isOwner, AI_IMAGE_QUOTA_COST, AI_IMAGE_TTL, AI_MAX_AUDIO_SEC, AI_STREAM } from './config.js';
 
 export async function handlePrivate(msg) {
   if (!msg.from || msg.from.is_bot) return;
@@ -63,6 +63,7 @@ const inStatus = async (msg, existing, text, fn) => {
 // opts.imageId — картинка, присланная прямо сейчас; opts.skipQuota — лимит уже списан (голосовые);
 // opts.status — уже показанный статус (setStatus из withStatus).
 export async function chat(msg, user, input, { imageId = null, skipQuota = false, kind = 'text', status = null } = {}) {
+  const stream = streamReply(msg, { reply: false });   // ответ печатается на глазах: сообщение дописывается по ходу генерации
   try {
     if (!skipQuota) await checkQuota(user.tgId);
     if (!(await getAiConfig())) throw new AiError('not_configured');   // не мигаем статусом перед ошибкой
@@ -77,20 +78,25 @@ export async function chat(msg, user, input, { imageId = null, skipQuota = false
         if (recent) src = await loadImage(recent).catch(() => null);   // file_id мог протухнуть — не страшно
       }
 
+      let writing = false;
+      const onText = AI_STREAM
+        ? async (partial) => {
+            if (!writing) { writing = true; await setStatus('✍️ Пишу…'); }   // первые слова пошли — «Думаю…» уже не про это
+            await stream.push(partial);
+          }
+        : null;
+
       const out = await askAi({
         userId: user.tgId, name: user.name, persona: user.persona, input, useMemory: user.aiMemory !== false,
-        images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true,
+        images: src ? [toDataUrl(src.bytes, src.mime)] : [], canImage: true, onText,
       });
       await logAi({ from: msg.from, kind, input, model: out.model, usage: out.usage });   // токены уже потрачены
-      if (out.image) {
-        if (out.text) await sayMarkdown(msg, out.text, { reply: false });
-        await produceImage(msg, user, out.image, src, { setStatus });
-      } else {
-        await sayMarkdown(msg, out.text, { reply: false });
-      }
+      await stream.finish(out.text);   // финальная версия: убирает курсор, досылает хвост длинного ответа
+      if (out.image) await produceImage(msg, user, out.image, src, { setStatus });
       await out.commit();
     });
   } catch (e) {
+    await stream.abort();
     await aiFailure(msg, user, e);
   }
 }

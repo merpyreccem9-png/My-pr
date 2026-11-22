@@ -16,6 +16,11 @@ export const LIMITS = { enabled: false };
 
 export const AI_MAX_INPUT = 4000;   // максимум символов во входящем сообщении
 
+// Плавный вывод ответа: текст появляется по мере генерации (сообщение редактируется), как в ChatGPT.
+// false — вернуть старое поведение: один готовый ответ целиком.
+export const AI_STREAM = true;
+export const AI_STREAM_INTERVAL_MS = 1000;   // не чаще одной правки сообщения в секунду (лимиты Telegram)
+
 // Модель по умолчанию: GPT-6 Luna с максимальным («extra high») рассуждением.
 // Меняется командами владельца: /setai, /seteffort, /setimage, /setstt.
 export const AI_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
