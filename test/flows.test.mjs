@@ -15,7 +15,13 @@ import {
   resetDb, resetApi, resetFetch, dump, db, apiCalls, members, apiFail, calls, lastText,
   mockFetch, fetchCalls, jsonResponse, fileBytes,
 } from './stub-sdk.mjs';
-import { history, usage } from '../tgcloud/schema.js';
+import { history, usage, kv as kvTable } from '../tgcloud/schema.js';
+import stateEp from '../tgcloud/endpoints/state.js';
+import sendEp from '../tgcloud/endpoints/send.js';
+import pollEp from '../tgcloud/endpoints/poll.js';
+import setDepthEp from '../tgcloud/endpoints/setDepth.js';
+import githubEp from '../tgcloud/endpoints/github.js';
+import resetChatEp from '../tgcloud/endpoints/resetChat.js';
 
 const U = (id, name = 'User', extra = {}) => ({ id, first_name: `${name}`, is_bot: false, ...extra });
 const ADMIN = U(1, 'Админ');
@@ -1598,4 +1604,211 @@ test('умная память: пока вышедшего мало, лишни�
   await send(pmsg(OWNER, 'новое'));
   assert.equal(fetchCalls.length, 1);
   assert.match(kvOf(`pend.${OWNER.id}`), /Пользователь: m1/);
+});
+
+// ── Mini App (endpoints) ────────────────────────────────────────────────
+
+const ep = (fn, input = {}, u = OWNER) => fn(input, { initData: { user: u } });
+const respEvents = (text, { think = '', tool = null } = {}) => [
+  { type: 'response.created', response: {} },
+  ...(think ? [
+    { type: 'response.reasoning_summary_part.added' },
+    { type: 'response.reasoning_summary_text.delta', delta: think },
+  ] : []),
+  ...(text ? [{ type: 'response.output_text.delta', delta: text.slice(0, 5) }, { type: 'response.output_text.delta', delta: text.slice(5) }] : []),
+  { type: 'response.completed', response: {
+    output: [
+      ...(think ? [{ type: 'reasoning', summary: [{ type: 'summary_text', text: think }] }] : []),
+      ...(tool ? [{ type: 'function_call', name: tool.name, arguments: JSON.stringify(tool.args), call_id: 'call_1' }] : []),
+      ...(text ? [{ type: 'message', content: [{ type: 'output_text', text }] }] : []),
+    ],
+    usage: { input_tokens: 9, output_tokens: 4 },
+  } },
+];
+
+test('Mini App state: профиль, глубина, диалог и GitHub-статус', async () => {
+  await sendKeyOnly();
+  await db.insert(history).values({ userId: OWNER.id, role: 'user', content: 'привет' }).run();
+  await db.insert(history).values({ userId: OWNER.id, role: 'assistant', content: 'здравствуй' }).run();
+  const st = await ep(stateEp);
+  assert.equal(st.name, 'Оля');
+  assert.equal(st.configured, true);
+  assert.equal(st.depth, 'auto');
+  assert.deepEqual(st.history, [{ role: 'user', content: 'привет' }, { role: 'assistant', content: 'здравствуй' }]);
+  assert.deepEqual(st.github, { connected: false, login: null });
+  assert.deepEqual(st.depths.map((d) => d.key), ['auto', 'fast', 'normal', 'deep']);
+  assert.equal(st.run, null);
+});
+
+test('Mini App: без initData эндпоинт не работает', async () => {
+  await assert.rejects(() => stateEp({}, {}), (e) => e.parameters.code === 'NO_USER');
+});
+
+test('Mini App send: «мысли» и текст пишутся в run, итог в историю; poll отдаёт тот же итог', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => sseResponse(respEvents('Привет, Оля!', { think: 'Пользователь здоровается.' }).map((e) => e)));
+  const res = await ep(sendEp, { text: 'привет', runId: 'r1' });
+
+  const body = JSON.parse(fetchCalls[0].init.body);
+  assert.equal(body.reasoning.summary, 'auto');       // просим краткое изложение мыслей
+  assert.equal(body.stream, true);
+  assert.equal(res.done, true);
+  assert.equal(res.text, 'Привет, Оля!');
+  assert.deepEqual(res.trace, [{ k: 'think', t: 'Пользователь здоровается.' }]);
+  assert.deepEqual(dump('history').map((h) => h.content), ['привет', 'Привет, Оля!']);
+
+  const polled = await ep(pollEp, { runId: 'r1' });
+  assert.equal(polled.run.text, 'Привет, Оля!');
+  assert.equal(polled.run.done, true);
+  assert.equal((await ep(pollEp, { runId: 'другой' })).run, null);
+  assert.equal(dump('ai_log').at(-1).kind, 'app');
+});
+
+test('Mini App send: Заново / Короче / Подробнее используют прошлый вопрос и заменяют обмен', async () => {
+  await sendKeyOnly();
+  aiReply('Первый ответ');
+  await ep(sendEp, { text: 'расскажи про Луну', runId: 'a' });
+  aiReply('Подробный ответ');
+  await ep(sendEp, { mode: 'long', runId: 'b' });
+  assert.match(userTextOf(lastBody()), /^расскажи про Луну\n\n\[Ответь подробнее/);
+  aiReply('Ещё раз');
+  await ep(sendEp, { regen: true, runId: 'c' });
+  assert.equal(userTextOf(lastBody()), 'расскажи про Луну');
+  assert.deepEqual(dump('history').map((h) => h.content), ['расскажи про Луну', 'Ещё раз']);
+  await assert.rejects(() => ep(sendEp, { text: '  ' }), (e) => e.parameters.code === 'EMPTY');
+});
+
+test('Mini App send: ошибки — понятные коды; параллельный запрос — BUSY', async () => {
+  OWNER_IDS.length = 0;
+  await assert.rejects(() => ep(sendEp, { text: 'привет', runId: 'x' }, VASYA), (e) => e.parameters.code === 'NOT_CONFIGURED');
+  await sendKeyOnly();
+  OWNER_IDS.length = 0;                                                 // обычный пользователь — действуют лимиты
+  await db.update(usage).set({ n: 10_000 }).run();                      // строка usage уже появилась при первой попытке
+  await assert.rejects(() => ep(sendEp, { text: 'привет', runId: 'y' }, VASYA), (e) => e.parameters.code === 'QUOTA');
+
+  OWNER_IDS.push(OWNER.id);
+  await db.insert(kvTable).values({ key: `run.${OWNER.id}`, value: JSON.stringify({ id: 'z', t0: Date.now(), done: false, text: '', trace: [] }) }).run();
+  await assert.rejects(() => ep(sendEp, { text: 'привет', runId: 'w' }), (e) => e.parameters.code === 'BUSY');
+});
+
+test('Mini App: глубина и сброс чата', async () => {
+  await sendKeyOnly();
+  assert.equal((await ep(setDepthEp, { depth: 'deep' })).depth, 'deep');
+  assert.equal((await ep(stateEp)).depth, 'deep');
+  await assert.rejects(() => ep(setDepthEp, { depth: 'turbo' }), (e) => e.parameters.code === 'BAD_DEPTH');
+  await db.insert(history).values({ userId: OWNER.id, role: 'user', content: 'x' }).run();
+  await ep(resetChatEp);
+  assert.deepEqual(dump('history'), []);
+});
+
+// ── Коннектор GitHub ────────────────────────────────────────────────────
+
+const GH_TOKEN = 'github_pat_TESTTESTTESTTESTTESTTEST';
+const ghUserRes = (scopes = '') => ({ ok: true, status: 200, headers: { get: (k) => (k === 'x-oauth-scopes' ? scopes : null) }, json: async () => ({ login: 'olya' }), text: async () => '{"login":"olya"}' });
+
+test('GitHub (Mini App): подключение проверяет токен, отключение стирает его', async () => {
+  await sendKeyOnly();
+  mockFetch(async (url, init) => {
+    assert.equal(url, 'https://api.github.com/user');
+    assert.equal(init.headers.Authorization, `Bearer ${GH_TOKEN}`);
+    return ghUserRes('repo');
+  });
+  const r = await ep(githubEp, { action: 'connect', token: GH_TOKEN });
+  assert.deepEqual(r, { connected: true, login: 'olya', wide: true });   // широкий токен — предупреждаем
+  assert.equal(dump('kv').find((k) => k.key === `gh.${OWNER.id}`).value, GH_TOKEN);
+  assert.equal((await ep(stateEp)).github.login, 'olya');
+  assert.ok(!JSON.stringify(r).includes(GH_TOKEN));                       // токен клиенту не возвращается
+
+  await ep(githubEp, { action: 'disconnect' });
+  assert.equal(dump('kv').find((k) => k.key === `gh.${OWNER.id}`).value, '');
+  mockFetch(async () => jsonResponse({ message: 'Bad credentials' }, 401));
+  await assert.rejects(() => ep(githubEp, { action: 'connect', token: GH_TOKEN }), (e) => /недействителен/.test(e.description));
+  await assert.rejects(() => ep(githubEp, { action: 'connect', token: 'abc' }), (e) => e.parameters.code === 'BAD_TOKEN');
+});
+
+test('GitHub (бот): /github ТОКЕН подключает и удаляет сообщение с токеном', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => ghUserRes());
+  const m = pmsg(OWNER, `/github ${GH_TOKEN}`);
+  await send(m);
+  assert.ok(calls('deleteMessage').some((d) => d.message_id === m.message_id));
+  assert.match(lastText(), /подключён: <b>@olya<\/b>/);
+  assert.ok(!apiCalls.some((c) => JSON.stringify(c.params).includes(GH_TOKEN)));   // токен нигде не эхо-ится
+  await send(pmsg(OWNER, '/github off'));
+  assert.equal(dump('kv').find((k) => k.key === `gh.${OWNER.id}`).value, '');
+});
+
+test('GitHub: модель вызывает функцию, бот читает файл и отдаёт результат обратно модели', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => ghUserRes());
+  await send(pmsg(OWNER, `/github ${GH_TOKEN}`));
+  apiCalls.length = 0;
+
+  let step = 0;
+  mockFetch(async (url, init) => {
+    if (url.endsWith('/responses')) {
+      step++;
+      const body = JSON.parse(init.body);
+      if (step === 1) {
+        assert.ok(body.tools.some((t) => t.name === 'github_read_file'));
+        assert.deepEqual(body.include, ['reasoning.encrypted_content']);
+        return jsonResponse({ output: [
+          { type: 'reasoning', id: 'rs_1', summary: [] },
+          { type: 'function_call', name: 'github_read_file', arguments: JSON.stringify({ repo: 'olya/proj', path: 'README.md' }), call_id: 'call_1' },
+        ], usage: { input_tokens: 10, output_tokens: 5 } });
+      }
+      const out = body.input.find((i) => i.type === 'function_call_output');
+      assert.equal(out.call_id, 'call_1');
+      assert.equal(out.output, '# Мой проект\nописание');
+      assert.ok(body.input.some((i) => i.type === 'function_call'), 'вызов функции возвращается модели вместе с результатом');
+      return jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'В README написано: «Мой проект».' }] }], usage: { input_tokens: 30, output_tokens: 9 } });
+    }
+    assert.equal(url, 'https://api.github.com/repos/olya/proj/contents/README.md');
+    assert.equal(init.headers.Authorization, `Bearer ${GH_TOKEN}`);
+    return { ok: true, status: 200, headers: { get: () => 'application/vnd.github.raw' }, text: async () => '# Мой проект\nописание' };
+  });
+  await send(pmsg(OWNER, 'что в README у olya/proj?'));
+
+  assert.equal(step, 2);
+  assert.ok(calls('editMessageText').some((e) => e.text === '🐙 Читаю olya/proj/README.md…'));   // статус с действием
+  assert.equal(lastText(), 'В README написано: «Мой проект».');
+  assert.deepEqual(dump('history').map((h) => h.content), ['что в README у olya/proj?', 'В README написано: «Мой проект».']);
+  assert.equal(dump('ai_log').at(-1).tin, 40);   // токены обоих шагов суммируются
+});
+
+test('GitHub: ошибка GitHub возвращается модели текстом, цикл не падает; без токена функций нет', async () => {
+  await sendKeyOnly();
+  mockFetch(async () => ghUserRes());
+  await send(pmsg(OWNER, `/github ${GH_TOKEN}`));
+  let step = 0;
+  mockFetch(async (url, init) => {
+    if (url.endsWith('/responses')) {
+      step++;
+      if (step === 1) return jsonResponse({ output: [{ type: 'function_call', name: 'github_read_file', arguments: JSON.stringify({ repo: 'olya/nope', path: 'x' }), call_id: 'c9' }] });
+      const out = JSON.parse(init.body).input.find((i) => i.type === 'function_call_output');
+      assert.match(out.output, /^Ошибка: не найдено/);
+      return jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Такого файла нет.' }] }] });
+    }
+    return jsonResponse({ message: 'Not Found' }, 404);
+  });
+  await send(pmsg(OWNER, 'открой olya/nope'));
+  assert.equal(lastText(), 'Такого файла нет.');
+
+  await send(pmsg(OWNER, '/github off'));
+  mockFetch(async (url, init) => {
+    assert.ok(!(JSON.parse(init.body).tools ?? []).some((t) => String(t.name ?? t.function?.name).startsWith('github_')));
+    return jsonResponse({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'ок' }] }] });
+  });
+  await send(pmsg(OWNER, 'привет'));
+  assert.equal(lastText(), 'ок');
+});
+
+test('/setapp: кнопка Mini App в меню бота и на главном экране (только владелец)', async () => {
+  OWNER_IDS.push(OWNER.id);
+  await send(pmsg(OWNER, '/setapp http://плохо'));
+  assert.match(lastText(), /Использование/);
+  await send(pmsg(OWNER, '/setapp https://app42.example.com/'));
+  assert.deepEqual(calls('setChatMenuButton').at(-1).menu_button, { type: 'web_app', text: 'Luna', web_app: { url: 'https://app42.example.com/' } });
+  await send(pmsg(OWNER, '/menu'));
+  assert.deepEqual(calls('sendMessage').at(-1).reply_markup.inline_keyboard[0], [{ text: '📱 Открыть Luna', web_app: { url: 'https://app42.example.com/' } }]);
 });

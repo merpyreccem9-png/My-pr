@@ -1,6 +1,6 @@
 // Личные сообщения: команды, ввод из меню, ИИ-диалог.
 
-import { api, db } from 'sdk';
+import { api, db, BotApiError } from 'sdk';
 import { users, chats, history } from '../schema.js';
 import { esc, maskKey } from './fmt.js';
 import { splitCommand, parseGender } from './parse.js';
@@ -13,7 +13,7 @@ import { logAi, statsText, logText, userText } from './stats.js';
 import {
   pickMedia, loadImage, downloadFile, toDataUrl, transcribe, generateImage, editImage, sendImage,
 } from './media.js';
-import { homeScreen, helpScreen, rpList, personaScreen, memScreen, depthScreen, githubScreen, answerKb } from './menu.js';
+import { APP_URL_KEY, homeScreen, helpScreen, rpList, personaScreen, memScreen, depthScreen, githubScreen, answerKb } from './menu.js';
 import { ghWhoami, ghErrorText, setGhToken } from './github.js';
 import { isOwner, AI_IMAGE_QUOTA_COST, AI_IMAGE_TTL, AI_MAX_AUDIO_SEC, AI_STREAM } from './config.js';
 
@@ -378,6 +378,22 @@ async function ownerCommand(msg, user, cmd) {
       }
       await setAiConfig({ effort: e });
       await say(msg, `✅ Effort: <code>${e}</code>`);
+      return true;
+    }
+    case 'setapp': {
+      const url = cmd.args.trim();
+      if (!/^https:\/\/\S+$/.test(url)) {
+        await say(msg, 'Использование: <code>/setapp https://адрес-вашего-приложения</code> — ссылка, которую показал <code>npm run deploy</code>. Появится кнопка «📱 Открыть Luna» в меню бота и на главном экране.');
+        return true;
+      }
+      await kvSet(APP_URL_KEY, url);
+      try {
+        await api.setChatMenuButton({ menu_button: { type: 'web_app', text: 'Luna', web_app: { url } } });
+        await say(msg, '✅ Mini App подключён: кнопка «Luna» появилась рядом с полем ввода.');
+      } catch (e) {
+        if (!(e instanceof BotApiError)) throw e;
+        await say(msg, `✅ Адрес сохранён (кнопка на главном экране есть), но меню бота обновить не вышло: <code>${esc(e.description)}</code>`);
+      }
       return true;
     }
     case 'setfast': {

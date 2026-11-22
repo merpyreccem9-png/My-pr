@@ -5,6 +5,7 @@ import { ACTIONS } from './rp.js';
 import { PERSONAS, personaLabel, listFacts, DEPTHS, getDepth } from './ai.js';
 import { botUsername } from './store.js';
 import { getGhLogin } from './github.js';
+import { kvGetMany } from './store.js';
 import { AI_DAILY_LIMIT, AI_MAX_FACTS } from './config.js';
 
 const b = (text, data) => ({ text, callback_data: data });
@@ -89,11 +90,15 @@ export function rpList() {
   ].join('\n');
 }
 
+export const APP_URL_KEY = 'app.url';   // адрес Mini App, его задаёт владелец командой /setapp
+
 export async function homeScreen(user) {
+  const appUrl = (await kvGetMany([APP_URL_KEY]))[APP_URL_KEY];
   return {
     text: `👋 Привет, <b>${esc(user.name || 'друг')}</b>!\n\nЯ — модератор для групп с РП и личный ИИ-помощник с памятью. ` +
       'Просто напишите мне сообщение — отвечу. Или выберите раздел:',
     kb: kb([
+      ...(appUrl ? [[{ text: '📱 Открыть Luna', web_app: { url: appUrl } }]] : []),
       [b('🧠 Память', 'm:mem'), b('🎭 Персона', 'm:persona')],
       [b('🎬 РП', 'm:rp'), b('👤 Профиль', 'm:profile')],
       [b('🧩 Глубина мышления', 'm:depth'), b('🐙 GitHub', 'm:github')],

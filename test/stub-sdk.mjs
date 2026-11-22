@@ -208,4 +208,11 @@ export class FormData {
   append(k, v) { this.fields.push([k, v]); }
   get(k) { return this.fields.find(([n]) => n === k)?.[1]; }
 }
-export class EndpointError extends Error {}
+export class EndpointError extends Error {
+  constructor(description, parameters = {}) {
+    super(description);
+    this.description = description;
+    this.parameters = parameters;
+  }
+}
+
