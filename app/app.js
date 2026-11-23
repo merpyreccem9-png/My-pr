@@ -3,7 +3,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '4';   // показывается в меню: сразу видно, что открыта свежая версия
+  const VERSION = '5';   // показывается в меню: сразу видно, что открыта свежая версия
   const tg = window.Telegram && window.Telegram.WebApp;
   const $ = (s) => document.querySelector(s);
   const listEl = $('#list'), chatEl = $('#chat'), inputEl = $('#input'), sendEl = $('#send');

@@ -34,9 +34,9 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .icon-btn:active { background: var(--soft); }
 
 /* ── Глубина мышления (effort): всегда на виду ── */
-.seg { display: flex; gap: 6px; padding: 8px 12px; overflow-x: auto; background: var(--bg); border-bottom: 1px solid var(--line); scrollbar-width: none; }
+.seg { display: flex; gap: 5px; padding: 8px 10px; overflow-x: auto; background: var(--bg); border-bottom: 1px solid var(--line); scrollbar-width: none; }
 .seg::-webkit-scrollbar { display: none; }
-.seg button { flex: 1 0 auto; padding: 7px 12px; border-radius: 999px; background: var(--soft); font-size: 14px; font-weight: 550; white-space: nowrap; transition: background .15s, color .15s, transform .1s; }
+.seg button { flex: 1 1 0; min-width: 0; padding: 7px 4px; border-radius: 999px; background: var(--soft); font-size: 13px; font-weight: 550; white-space: nowrap; text-align: center; transition: background .15s, color .15s, transform .1s; }
 .seg button:active { transform: scale(.96); }
 .seg button.on { background: var(--accent); color: var(--accent-fg); }
 
