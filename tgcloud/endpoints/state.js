@@ -24,6 +24,7 @@ export default async function (input, ctx) {
     owner: isOwner(user.tgId),
     configured: Boolean(cfg),
     model: cfg?.model ?? null,
+    models: isOwner(user.tgId) && cfg ? { model: cfg.model, fast: cfg.fastModel, image: cfg.imageModel } : null,   // выбор моделей — только админам
     depth,
     depths: Object.entries(DEPTHS).map(([key, [label]]) => ({ key, label })),
     github: { connected: Boolean(login), login },

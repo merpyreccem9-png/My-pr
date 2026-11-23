@@ -3,6 +3,7 @@
 (() => {
   'use strict';
 
+  const VERSION = '4';   // показывается в меню: сразу видно, что открыта свежая версия
   const tg = window.Telegram && window.Telegram.WebApp;
   const $ = (s) => document.querySelector(s);
   const listEl = $('#list'), chatEl = $('#chat'), inputEl = $('#input'), sendEl = $('#send');
@@ -11,7 +12,7 @@
   const sheetEl = $('#sheet'), overlayEl = $('#overlay'), toastEl = $('#toast');
 
   const S = {
-    name: '', owner: false, configured: true, model: '', depth: 'auto',
+    name: '', owner: false, configured: true, model: '', models: null, depth: 'auto',
     github: { connected: false, login: null }, facts: [],
     messages: [], busy: false, hasLast: false,
     pending: { image: null, files: [] },   // вложения, ещё не отправленные
@@ -620,11 +621,51 @@
            <div class="row"><button class="btn" data-menu="ghon">Подключить</button></div>`}
       <h4>Что я помню о вас</h4>
       ${S.facts.length ? `<ul class="facts">${S.facts.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : '<p class="muted">Пока ничего — расскажите о себе в чате.</p>'}
-      ${S.owner && S.model ? `<h4>Модель</h4><p class="muted">${esc(S.model)}</p>` : ''}`;
+      ${S.owner && S.models ? `<h4>Модели · только админ</h4>
+        <button class="opt" data-menu="pick" data-kind="model"><span class="em">🧠</span><span class="tx"><b>Основная</b><span>${esc(S.models.model || '—')}</span></span></button>
+        <button class="opt" data-menu="pick" data-kind="fast"><span class="em">⚡</span><span class="tx"><b>Быстрая</b><span>${esc(S.models.fast || 'как основная')} · для «Короче» и сводок</span></span></button>
+        <button class="opt" data-menu="pick" data-kind="image"><span class="em">🎨</span><span class="tx"><b>Для картинок</b><span>${esc(S.models.image || '—')}</span></span></button>` : ''}
+      <p class="muted" style="margin-top:18px">Версия приложения ${VERSION}</p>`;
   }
-  menuBtn.addEventListener('click', () => { haptic('light'); openSheet(menuHtml()); });
+
+  // ── Выбор модели (только админы; сервер проверяет это сам) ───────────────
+  const PICK_TITLE = { model: 'Основная модель', fast: 'Быстрая модель', image: 'Модель для картинок' };
+  async function openPicker(kind) {
+    openSheet(`<h3>${PICK_TITLE[kind]}</h3><p class="muted">Загружаю список…</p>`);
+    let data;
+    try { data = await rpc('models'); } catch (e) { openSheet(menuHtml()); toast(e.message || 'Не получилось'); return; }
+    S.models = data.current;
+    const cur = data.current[kind] || '';
+    const list = data.list;
+    const draw = (q) => {
+      const needle = q.trim().toLowerCase();
+      const items = list.filter((id) => id.toLowerCase().includes(needle)).slice(0, 80);
+      const own = needle && !list.includes(q.trim()) ? `<button class="opt" data-model="${esc(q.trim())}"><span class="em">✏️</span><span class="tx"><b>Использовать «${esc(q.trim())}»</b><span>ввести название вручную</span></span></button>` : '';
+      const off = kind === 'fast' ? `<button class="opt" data-model="off"><span class="em">↩️</span><span class="tx"><b>Как основная</b><span>без отдельной быстрой модели</span></span>${!cur ? '<span class="ck">✓</span>' : ''}</button>` : '';
+      return `${off}${own}${items.map((id) => `<button class="opt" data-model="${esc(id)}"><span class="em">${id === cur ? '✅' : '▫️'}</span><span class="tx"><b>${esc(id)}</b></span></button>`).join('') || (own ? '' : '<p class="muted">Ничего не найдено</p>')}`;
+    };
+    openSheet(`<h3>${PICK_TITLE[kind]}</h3><p class="muted">Сейчас: <b>${esc(cur || 'как основная')}</b></p>
+      <input id="mq" class="field" placeholder="Поиск или своё название" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div id="mlist" style="margin-top:8px">${draw('')}</div>`);
+    sheetEl.dataset.kind = kind;
+    sheetEl._draw = draw;
+  }
+  sheetEl.addEventListener('input', (ev) => {
+    if (ev.target.id === 'mq' && sheetEl._draw) $('#mlist').innerHTML = sheetEl._draw(ev.target.value);
+  });
+  menuBtn.addEventListener('click', () => { haptic('light'); sheetEl._draw = null; openSheet(menuHtml()); });
 
   sheetEl.addEventListener('click', async (ev) => {
+    const mdl = ev.target.closest('[data-model]');
+    if (mdl && sheetEl.dataset.kind) {
+      const kind = sheetEl.dataset.kind;
+      try {
+        const r = await rpc('setModel', { kind, id: mdl.dataset.model });
+        S.models = r.current; sheetEl._draw = null; delete sheetEl.dataset.kind;
+        openSheet(menuHtml()); toast('Модель сохранена');
+      } catch (e) { toast(e.message || 'Не получилось'); }
+      return;
+    }
     const act = ev.target.closest('[data-menu]');
     if (!act) return;
     switch (act.dataset.menu) {
@@ -646,6 +687,7 @@
         } catch (e) { act.disabled = false; toast(e.message || 'Не получилось'); }
         break;
       }
+      case 'pick': openPicker(act.dataset.kind); break;
       case 'ghoff':
         try { await rpc('github', { action: 'disconnect' }); S.github = { connected: false, login: null }; openSheet(menuHtml()); toast('GitHub отключён'); } catch (e) { toast('Не получилось'); }
         break;
@@ -683,7 +725,7 @@
     renderAll();
     try {
       const st = await rpc('state');
-      Object.assign(S, { name: st.name, owner: st.owner, configured: st.configured, model: st.model, depth: st.depth, github: st.github, facts: st.facts, hasLast: st.hasLast });
+      Object.assign(S, { name: st.name, owner: st.owner, configured: st.configured, model: st.model, models: st.models, depth: st.depth, github: st.github, facts: st.facts, hasLast: st.hasLast });
       S.messages = [];
       for (const h of st.history) addMessage(h.role === 'user'
         ? { role: 'user', ...parseUserText(h.content) }

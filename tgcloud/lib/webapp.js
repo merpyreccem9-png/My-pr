@@ -63,3 +63,8 @@ export function appError(e, userId) {
       return [owner ? `Ошибка ИИ (${e.code}): ${String(e.detail ?? '').slice(0, 300)}` : 'ИИ сейчас недоступен. Попробуйте позже.', 'AI_ERROR'];
   }
 }
+
+// Настройки модели — только для админов (владельцев бота). Проверка на сервере, кнопка в приложении — лишь удобство.
+export function requireOwner(user) {
+  if (!isOwner(user.tgId)) throw new EndpointError('Это доступно только админам', { code: 'FORBIDDEN' });
+}

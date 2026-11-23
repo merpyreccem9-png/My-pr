@@ -24,6 +24,8 @@ import githubEp from '../tgcloud/endpoints/github.js';
 import resetChatEp from '../tgcloud/endpoints/resetChat.js';
 import imageEp from '../tgcloud/endpoints/image.js';
 import deliverEp from '../tgcloud/endpoints/deliver.js';
+import modelsEp from '../tgcloud/endpoints/models.js';
+import setModelEp from '../tgcloud/endpoints/setModel.js';
 
 const U = (id, name = 'User', extra = {}) => ({ id, first_name: `${name}`, is_bot: false, ...extra });
 const ADMIN = U(1, 'Админ');
@@ -1908,4 +1910,39 @@ test('код в ответе бота: блок с языком уходит в 
   aiReply('Вот пример:\n```python\nprint(1 < 2)\n```');
   await send(pmsg(OWNER, 'покажи код'));
   assert.equal(lastText(), 'Вот пример:\n<pre><code class="language-python">print(1 &lt; 2)</code></pre>');
+});
+
+// ── Выбор моделей: только админы ────────────────────────────────────────
+
+test('модели: список и выбор доступны только админу, обычному — FORBIDDEN', async () => {
+  await sendKeyOnly();
+  mockFetch(async (url, init) => {
+    assert.equal(url, 'https://api.openai.com/v1/models');
+    assert.match(init.headers.Authorization, /^Bearer /);
+    return jsonResponse({ data: [{ id: 'gpt-6-luna' }, { id: 'gpt-6-luna-mini' }, { id: 'gpt-image-2.5-sunburst' }, { id: 'gpt-6-luna' }] });
+  });
+  const r = await ep(modelsEp);
+  assert.deepEqual(r.list, ['gpt-6-luna', 'gpt-6-luna-mini', 'gpt-image-2.5-sunburst']);   // без повторов, по алфавиту
+  assert.equal(r.current.model, 'gpt-6-luna');
+
+  for (const fn of [modelsEp, setModelEp]) {
+    await assert.rejects(() => ep(fn, { kind: 'model', id: 'gpt-6-luna-mini' }, VASYA), (e) => e.parameters.code === 'FORBIDDEN');
+  }
+  assert.equal((await ep(stateEp)).models.model, 'gpt-6-luna');
+  assert.equal((await ep(stateEp, {}, VASYA)).models, null);          // обычный пользователь настроек моделей не видит
+});
+
+test('модели: выбор основной / быстрой / картинок и защита от странных названий', async () => {
+  await sendKeyOnly();
+  assert.equal((await ep(setModelEp, { kind: 'model', id: 'gpt-6-luna-mini' })).current.model, 'gpt-6-luna-mini');
+  assert.equal((await ep(setModelEp, { kind: 'fast', id: 'my-fast:1' })).current.fast, 'my-fast:1');
+  assert.equal((await ep(setModelEp, { kind: 'image', id: 'gpt-image-x' })).current.image, 'gpt-image-x');
+  assert.equal((await ep(setModelEp, { kind: 'fast', id: 'off' })).current.fast, null);   // «как основная»
+  await assert.rejects(() => ep(setModelEp, { kind: 'model', id: 'off' }), (e) => e.parameters.code === 'BAD_MODEL');
+  await assert.rejects(() => ep(setModelEp, { kind: 'model', id: 'x y; drop' }), (e) => e.parameters.code === 'BAD_MODEL');
+  await assert.rejects(() => ep(setModelEp, { kind: 'voice', id: 'x' }), (e) => e.parameters.code === 'BAD_KIND');
+  // выбранная модель реально уходит в запрос
+  aiReply('ок');
+  await ep(sendEp, { text: 'привет', runId: 'm1' });
+  assert.equal(lastBody().model, 'gpt-6-luna-mini');
 });
