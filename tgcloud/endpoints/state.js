@@ -6,7 +6,7 @@ import { getAiConfig, getDepth, DEPTHS, listFacts, lastKey } from '../lib/ai.js'
 import { getGhLogin } from '../lib/github.js';
 import { kvGetMany } from '../lib/store.js';
 import { isOwner, AI_HISTORY } from '../lib/config.js';
-import { appUser, loadRun, publicRun } from '../lib/webapp.js';
+import { appUser, loadRun, publicRun, settleStale } from '../lib/webapp.js';
 
 export default async function (input, ctx) {
   const { user } = await appUser(ctx);
@@ -31,6 +31,6 @@ export default async function (input, ctx) {
     facts: facts.map((f) => f.body),
     history: rows.reverse().map((r) => ({ role: r.role, content: r.content })),
     hasLast: Boolean(last[lastKey(user.tgId)]),
-    run: run && !run.done ? publicRun(run) : null,   // запрос ещё идёт (например, приложение закрыли и открыли снова)
+    run: run && !(await settleStale(user.tgId, run)).done ? publicRun(run) : null,   // запрос ещё идёт (например, приложение закрыли и открыли снова)
   };
 }

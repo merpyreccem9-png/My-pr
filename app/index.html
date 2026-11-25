@@ -6,26 +6,30 @@
   <meta name="color-scheme" content="light dark">
   <title>Luna</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="style.css?v=5">
+  <link rel="stylesheet" href="style.css?v=7">
 </head>
 <body>
+  <div id="wall" class="wall" data-wall="aurora" aria-hidden="true"></div>
   <div id="app">
     <header class="top">
-      <div class="avatar">🌙</div>
+      <div class="avatar" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </div>
       <div class="who">
         <div class="name">Luna</div>
         <div id="status" class="status">в сети</div>
       </div>
+      <button id="themeBtn" class="icon-btn" aria-label="Тема"></button>
       <button id="menuBtn" class="icon-btn" aria-label="Меню">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
       </button>
     </header>
 
     <nav id="effort" class="seg" aria-label="Глубина мышления">
-      <button data-depth="fast">⚡ Быстро</button>
-      <button data-depth="normal">⚖️ Обычно</button>
-      <button data-depth="deep">🧠 Глубоко</button>
-      <button data-depth="auto">🤖 Авто</button>
+      <button data-depth="fast"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>Быстро</button>
+      <button data-depth="normal"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Обычно</button>
+      <button data-depth="deep"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 0 7 4.5V5a3 3 0 0 0-2 5 3 3 0 0 0 1 5.4V17a3 3 0 0 0 3 3h.5V2zM14.5 2A2.5 2.5 0 0 1 17 4.5V5a3 3 0 0 1 2 5 3 3 0 0 1-1 5.4V17a3 3 0 0 1-3 3h-.5V2z"/></svg>Глубоко</button>
+      <button data-depth="auto"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3zM19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15z"/></svg>Авто</button>
     </nav>
 
     <main id="chat" class="chat"><div id="list" class="list"></div></main>
@@ -34,7 +38,7 @@
       <div id="tray" class="tray hidden"></div>
       <div class="box">
         <button id="attach" class="clip" aria-label="Прикрепить файл или фото">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5l-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l8.6-8.6a3.7 3.7 0 0 1 5.2 5.2l-8.7 8.7a1.8 1.8 0 0 1-2.6-2.6l8-8"/></svg>
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5l-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l8.6-8.6a3.7 3.7 0 0 1 5.2 5.2l-8.7 8.7a1.8 1.8 0 0 1-2.6-2.6l8-8"/></svg>
         </button>
         <textarea id="input" rows="1" placeholder="Сообщение Луне…" enterkeyhint="send"></textarea>
         <button id="send" class="send" aria-label="Отправить" disabled>
@@ -48,6 +52,6 @@
   <div id="overlay" class="overlay hidden"></div>
   <div id="sheet" class="sheet hidden" role="dialog" aria-modal="true"></div>
   <div id="toast" class="toast hidden"></div>
-  <script src="app.js?v=5"></script>
+  <script src="app.js?v=7"></script>
 </body>
 </html>

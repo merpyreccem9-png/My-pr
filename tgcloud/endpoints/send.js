@@ -1,24 +1,26 @@
 // Отправить сообщение (или «Заново / Короче / Подробнее»). Ход работы пишется в kv — клиент читает его через poll.
 import { EndpointError } from 'sdk';
 import { askAi, checkQuota, getAiConfig, AiError, lastKey } from '../lib/ai.js';
-import { generateImage, editImage, sendTextFile, b64ToBytes, toDataUrl } from '../lib/media.js';
-import { AI_IMAGE_QUOTA_COST } from '../lib/config.js';
+import { sendTextFile } from '../lib/media.js';
 import { logAi } from '../lib/stats.js';
 import { kvGetMany, kvSet } from '../lib/store.js';
-import { appUser, loadRun, saveRun, publicRun, appError, attachments, withFiles, imgKey } from '../lib/webapp.js';
+import { appUser, loadRun, saveRun, publicRun, appError, attachments, withFiles, recentAppImage, rememberAppImage, isStale } from '../lib/webapp.js';
 
 const MODES = new Set(['short', 'long']);
 const SAVE_EVERY_MS = 450;     // не чаще — это запись в базу
-const STALE_RUN_MS = 6 * 60 * 1000;
 
 export default async function (input, ctx) {
   const { tg, user } = await appUser(ctx);
   const mode = MODES.has(input.mode) ? input.mode : null;
   const regen = input.regen === true || Boolean(mode);
 
-  const { images, files } = regen ? { images: [], files: [] } : attachments(input);
+  const att = regen ? { images: [], files: [] } : attachments(input);
+  const files = att.files;
+  // Нет новой картинки — берём последнюю (прикреплённую или нарисованную): так работает «сделай ярче», «добавь шляпу».
+  const recent = !regen && !att.images.length ? await recentAppImage(user.tgId) : null;
+  const images = att.images.length ? att.images : recent ? [recent.dataUrl] : [];
   let text = String(input.text ?? '').trim().slice(0, 4000);
-  if (!text && !regen && images.length) text = 'Посмотри на картинку и расскажи, что на ней.';
+  if (!text && !regen && att.images.length) text = 'Посмотри на картинку и расскажи, что на ней.';
   if (!text && !regen && files.length) text = 'Посмотри файл и коротко расскажи, что в нём.';
   if (files.length) text = withFiles(text, files);
   if (regen) {
@@ -29,7 +31,7 @@ export default async function (input, ctx) {
 
   // Один запрос за раз: параллельные писали бы в одну историю.
   const prev = await loadRun(user.tgId);
-  if (prev && !prev.done && Date.now() - prev.t0 < STALE_RUN_MS) {
+  if (prev && !prev.done && !isStale(prev) && input.force !== true) {   // force — «я остановил, пишу заново»
     throw new EndpointError('Предыдущий ответ ещё готовится', { code: 'BUSY' });
   }
 
@@ -42,10 +44,14 @@ export default async function (input, ctx) {
     await saveRun(user.tgId, run);
   };
 
+  // «Пульс»: пока модель думает молча, раз в 20 с отмечаем, что запрос жив (иначе его сочтут зависшим).
+  const beat = typeof setInterval === 'function' ? setInterval(() => { save(true).catch(() => {}); }, 20_000) : null;
+
   try {
     await checkQuota(user.tgId);
     if (!(await getAiConfig())) throw new AiError('not_configured');
     await save(true);
+    if (att.images.length) await rememberAppImage(user.tgId, 'att', att.images[0]);   // прикреплённое фото — тоже «текущая» картинка
 
     const out = await askAi({
       userId: user.tgId, name: user.name, persona: user.persona, input: text, useMemory: user.aiMemory !== false,
@@ -62,22 +68,18 @@ export default async function (input, ctx) {
     await logAi({ from: tg, kind: 'app', input: text, model: out.model, usage: out.usage });
     Object.assign(run, { text: out.text, trace: out.trace, live: '', model: out.model });
 
-    // Картинка по просьбе модели: рисуем/правим и кладём для клиента (он заберёт отдельным запросом).
+    // Картинка по просьбе модели: здесь только решение «рисовать». Саму генерацию делает отдельный запрос makeImage
+    // (у него свой запас времени), поэтому долгая картинка не обрывает ответ и не оставляет приложение «в процессе».
     if (out.image) {
-      await checkQuota(user.tgId, Math.max(0, AI_IMAGE_QUOTA_COST - 1));
-      const cfg = await getAiConfig();
-      if (!cfg) throw new AiError('not_configured');
       const editing = out.image.kind === 'edit' && images[0];
-      const step = { k: 'tool', id: 'img', name: editing ? 'edit_image' : 'generate_image', label: editing ? 'Правлю картинку…' : 'Рисую картинку…', args: { prompt: out.image.prompt }, state: 'run' };
-      run.trace = [...out.trace, step];
+      Object.assign(run, {
+        pending: { kind: editing ? 'edit' : 'generate', prompt: out.image.prompt, size: out.image.size ?? null },
+        trace: [...out.trace, { k: 'tool', id: 'img', name: editing ? 'edit_image' : 'generate_image', label: editing ? 'Правлю картинку…' : 'Рисую картинку…', args: { prompt: out.image.prompt }, state: 'run' }],
+      });
+      await kvSet(lastKey(user.tgId), JSON.stringify({ q: text }));
+      await out.commit();
       await save(true);
-      const t0 = Date.now();
-      const src = editing ? { bytes: b64ToBytes(images[0].split(',')[1]), mime: images[0].slice(5, images[0].indexOf(';')) } : null;
-      const result = editing ? await editImage(cfg, src, out.image.prompt) : await generateImage(cfg, out.image.prompt, out.image.size);
-      await kvSet(imgKey(user.tgId), JSON.stringify({ runId: run.id, dataUrl: toDataUrl(result.bytes, result.mime) }));
-      Object.assign(step, { state: 'ok', ms: Date.now() - t0, out: `${Math.round(result.bytes.length / 1024)} КБ` });
-      run.image = { id: run.id, mime: result.mime, kb: Math.round(result.bytes.length / 1024) };
-      await logAi({ from: tg, kind: editing ? 'img-edit' : 'img-gen', input: out.image.prompt, model: cfg.imageModel });
+      return publicRun(run);   // done:false — клиент сразу вызовет makeImage и продолжит читать прогресс
     }
 
     // Файл-документ: отправляем в чат с ботом (оттуда его можно открыть/переслать), текст отдаём и приложению.
@@ -104,5 +106,7 @@ export default async function (input, ctx) {
     await save(true).catch(() => {});
     if (!mapped) throw e;
     throw new EndpointError(mapped[0], { code: mapped[1] });
+  } finally {
+    if (beat) clearInterval(beat);
   }
 }

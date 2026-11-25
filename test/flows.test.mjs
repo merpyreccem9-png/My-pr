@@ -25,6 +25,8 @@ import resetChatEp from '../tgcloud/endpoints/resetChat.js';
 import imageEp from '../tgcloud/endpoints/image.js';
 import deliverEp from '../tgcloud/endpoints/deliver.js';
 import modelsEp from '../tgcloud/endpoints/models.js';
+import makeImageEp from '../tgcloud/endpoints/makeImage.js';
+import cancelEp from '../tgcloud/endpoints/cancel.js';
 import setModelEp from '../tgcloud/endpoints/setModel.js';
 
 const U = (id, name = 'User', extra = {}) => ({ id, first_name: `${name}`, is_bot: false, ...extra });
@@ -1856,10 +1858,18 @@ test('Mini App send: «нарисуй» → картинка сохраняет�
     assert.ok(url.endsWith('/images/generations'));
     return jsonResponse({ data: [{ b64_json: b64(PNG) }] });
   });
-  const res = await ep(sendEp, { text: 'нарисуй кота', runId: 'im1' });
+  const first = await ep(sendEp, { text: 'нарисуй кота', runId: 'im1' });
+  assert.equal(first.pending, true);                 // send только решил «рисовать» — картинку делает отдельный запрос
+  assert.equal(first.done, false);
+  assert.equal(first.image, null);
+  assert.equal(fetchCalls.some((c) => c.url.endsWith('/images/generations')), false);
+  const res = await ep(makeImageEp, { runId: 'im1' });
   assert.equal(n, 1);
   assert.equal(res.text, 'Держи кота');
-  assert.deepEqual(res.image, { id: 'im1', mime: 'image/png', kb: 0 });
+  assert.deepEqual(res.image, { id: 'im1', mime: 'image/png', kb: 0, sent: true });
+  assert.deepEqual(calls('sendPhoto').at(-1).photo.bytes, PNG);             // картинка пришла и в чат автоматически (надёжный путь)
+  assert.equal(calls('sendPhoto').at(-1).chat_id, OWNER.id);
+  assert.equal(JSON.parse(fetchCalls.find((c) => c.url.endsWith('/images/generations')).init.body).output_format, 'jpeg');   // лёгкий JPEG, а не PNG
   assert.equal(res.trace.at(-1).name, 'generate_image');
   assert.equal(res.trace.at(-1).state, 'ok');
   assert.deepEqual(dump('history').map((h) => h.content), ['нарисуй кота', 'Держи кота\n[нарисовал картинку: a cat]']);
@@ -1945,4 +1955,128 @@ test('модели: выбор основной / быстрой / картин�
   aiReply('ок');
   await ep(sendEp, { text: 'привет', runId: 'm1' });
   assert.equal(lastBody().model, 'gpt-6-luna-mini');
+});
+
+test('Mini App: «сделай ярче» следующим сообщением правит последнюю картинку (без повторной загрузки)', async () => {
+  await sendKeyOnly();
+  let step = 0;
+  mockFetch(async (url, init) => {
+    if (url.endsWith('/responses')) {
+      step++;
+      if (step === 1) return jsonResponse({ output: [{ type: 'function_call', name: 'generate_image', arguments: JSON.stringify({ prompt: 'a cat' }), call_id: 'g1' }] });
+      // второе сообщение: картинка уже у модели, и ей доступна edit_image
+      const body = JSON.parse(init.body);
+      assert.ok(body.tools.some((t) => t.name === 'edit_image'));
+      assert.ok(init.body.includes('data:image/jpeg;base64') || init.body.includes('data:image/png;base64'));
+      return jsonResponse({ output: [{ type: 'function_call', name: 'edit_image', arguments: JSON.stringify({ prompt: 'brighter' }), call_id: 'e1' }] });
+    }
+    if (url.endsWith('/images/generations')) return jsonResponse({ data: [{ b64_json: b64(JPG) }] });
+    assert.ok(url.endsWith('/images/edits'));
+    assert.equal(init.body.get('output_format'), 'jpeg');
+    return jsonResponse({ data: [{ b64_json: b64(PNG) }] });
+  });
+  await ep(sendEp, { text: 'нарисуй кота', runId: 'e-1' });
+  await ep(makeImageEp, { runId: 'e-1' });
+  await ep(sendEp, { text: 'сделай ярче', runId: 'e-2' });
+  const res = await ep(makeImageEp, { runId: 'e-2' });
+  assert.equal(res.image.id, 'e-2');
+  assert.equal(res.trace.at(-1).name, 'edit_image');
+  assert.equal((await ep(imageEp, { runId: 'e-2' })).dataUrl, `data:image/png;base64,${b64(PNG)}`);
+  assert.equal(calls('sendPhoto').length, 2);   // обе картинки пришли в чат
+});
+
+test('Mini App: картинка старше TTL не подмешивается; провайдер без output_format — тихий повтор', async () => {
+  await sendKeyOnly();
+  let n = 0;
+  mockFetch(async (url, init) => {
+    if (url.endsWith('/responses')) return jsonResponse({ output: [{ type: 'function_call', name: 'generate_image', arguments: JSON.stringify({ prompt: 'moon' }), call_id: 'g' }] });
+    n++;
+    if (n === 1) { assert.equal(JSON.parse(init.body).output_format, 'jpeg'); return jsonResponse({ error: { message: "Unknown parameter: 'output_format'." } }, 400); }
+    assert.equal(JSON.parse(init.body).output_format, undefined);
+    return jsonResponse({ data: [{ b64_json: b64(PNG) }] });
+  });
+  await ep(sendEp, { text: 'нарисуй луну', runId: 'o-1' });
+  const res = await ep(makeImageEp, { runId: 'o-1' });
+  assert.equal(n, 2);
+  assert.equal(res.image.id, 'o-1');
+
+  const key = `appimg.${OWNER.id}`;
+  const rec = JSON.parse(dump('kv').find((k) => k.key === key).value);
+  await db.update(kvTable).set({ value: JSON.stringify({ ...rec, ts: rec.ts - 100000 }) }).run();   // состарили
+  aiReply('Обычный ответ');
+  await ep(sendEp, { text: 'привет', runId: 'o-2' });
+  assert.ok(!fetchCalls.at(-1).init.body.includes('data:image'));
+});
+
+// ── Зависшие запуски, «Стоп» и отдельная генерация картинки ─────────────────
+
+test('makeImage: повторный вызов не запускает вторую генерацию; без запроса на картинку — NO_PENDING', async () => {
+  await sendKeyOnly();
+  await assert.rejects(() => ep(makeImageEp, { runId: 'нет' }), (e) => e.parameters.code === 'NO_PENDING');
+  let gens = 0;
+  mockFetch(async (url) => {
+    if (url.endsWith('/responses')) return jsonResponse({ output: [{ type: 'function_call', name: 'generate_image', arguments: JSON.stringify({ prompt: 'moon' }), call_id: 'g' }] });
+    gens++;
+    return jsonResponse({ data: [{ b64_json: b64(PNG) }] });
+  });
+  await ep(sendEp, { text: 'нарисуй луну', runId: 'mi-1' });
+  // Картинку уже рисует другой запрос (свежая отметка) — второй вызов только отдаёт состояние
+  const key = `run.${OWNER.id}`;
+  const run = JSON.parse(dump('kv').find((k) => k.key === key).value);
+  await db.update(kvTable).set({ value: JSON.stringify({ ...run, imageStarted: Date.now() }) }).run();
+  const busy = await ep(makeImageEp, { runId: 'mi-1' });
+  assert.equal(busy.done, false);
+  assert.equal(gens, 0);
+  // отметка устарела (запрос погиб) — рисуем
+  await db.update(kvTable).set({ value: JSON.stringify({ ...run, imageStarted: Date.now() - 200_000 }) }).run();
+  assert.ok((await ep(makeImageEp, { runId: 'mi-1' })).image);
+  assert.equal(gens, 1);
+  assert.equal((await ep(makeImageEp, { runId: 'mi-1' })).image.id, 'mi-1');      // уже готово — отдаём как есть
+  assert.equal(gens, 1);
+});
+
+test('makeImage: ошибка генерации закрывает запуск понятной ошибкой (приложение не зависает)', async () => {
+  await sendKeyOnly();
+  mockFetch(async (url) => (url.endsWith('/responses')
+    ? jsonResponse({ output: [{ type: 'function_call', name: 'generate_image', arguments: JSON.stringify({ prompt: 'x' }), call_id: 'g' }] })
+    : jsonResponse({ error: { code: 'moderation_blocked' } }, 400)));
+  await ep(sendEp, { text: 'нарисуй', runId: 'er-1' });
+  await assert.rejects(() => ep(makeImageEp, { runId: 'er-1' }), (e) => e.parameters.code === 'AI_ERROR' || e.parameters.code);
+  const run = (await ep(pollEp, { runId: 'er-1' })).run;
+  assert.equal(run.done, true);
+  assert.ok(run.error);
+  assert.equal(run.trace.at(-1).state, 'err');
+  // и после ошибки можно писать дальше
+  aiReply('Привет!');
+  assert.equal((await ep(sendEp, { text: 'привет', runId: 'er-2' })).text, 'Привет!');
+});
+
+test('зависший запуск (платформа оборвала запрос) сам закрывается ошибкой; BUSY снимается; «Стоп» и force работают', async () => {
+  await sendKeyOnly();
+  const old = Date.now() - 10 * 60 * 1000;
+  const stuck = { id: 'z1', t0: old, hb: old, done: false, text: '', trace: [], pending: { kind: 'generate', prompt: 'x' } };
+  await db.insert(kvTable).values({ key: `run.${OWNER.id}`, value: JSON.stringify(stuck) }).run();
+
+  const polled = (await ep(pollEp, { runId: 'z1' })).run;
+  assert.equal(polled.done, true);
+  assert.match(polled.error, /оборвался/);
+  assert.equal(polled.pending, false);
+  aiReply('ок');
+  assert.equal((await ep(sendEp, { text: 'привет', runId: 'z2' })).text, 'ок');     // новый запрос не блокируется
+
+  // «Стоп» закрывает живой запуск
+  await db.update(kvTable).set({ value: JSON.stringify({ id: 'z3', t0: Date.now(), hb: Date.now(), done: false, text: '', trace: [] }) }).run();
+  await assert.rejects(() => ep(sendEp, { text: 'ещё', runId: 'z4' }), (e) => e.parameters.code === 'BUSY');
+  await ep(cancelEp, { runId: 'z3' });
+  assert.equal((await ep(pollEp, { runId: 'z3' })).run.error, 'Остановлено');
+  aiReply('снова');
+  assert.equal((await ep(sendEp, { text: 'ещё', runId: 'z5' })).text, 'снова');
+
+  // force — «я остановил на своей стороне, пишу заново», даже если сервер ещё считает запуск живым
+  await db.update(kvTable).set({ value: JSON.stringify({ id: 'z6', t0: Date.now(), hb: Date.now(), done: false, text: '', trace: [] }) }).run();
+  aiReply('форс');
+  assert.equal((await ep(sendEp, { text: 'раз', runId: 'z7', force: true })).text, 'форс');
+  // state не отдаёт мёртвый запуск как «идущий»
+  await db.update(kvTable).set({ value: JSON.stringify(stuck) }).run();
+  assert.equal((await ep(stateEp)).run, null);
 });

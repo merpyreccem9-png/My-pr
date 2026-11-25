@@ -3,7 +3,7 @@
 import { EndpointError } from 'sdk';
 import { touchUser, kvGetMany, kvSet } from './store.js';
 import { AiError } from './ai.js';
-import { isOwner, AI_MAX_AUDIO_SEC } from './config.js';
+import { isOwner, AI_MAX_AUDIO_SEC, AI_IMAGE_TTL } from './config.js';
 
 export const runKey = (id) => `run.${id}`;
 
@@ -19,19 +19,36 @@ export async function loadRun(userId) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-export const saveRun = (userId, run) => kvSet(runKey(userId), JSON.stringify(run));
+export function saveRun(userId, run) {
+  run.hb = Date.now();   // «пульс»: по нему видно, что запрос жив
+  return kvSet(runKey(userId), JSON.stringify(run));
+}
+
+// Платформа может оборвать долгий запрос — запись о нём остаётся «в процессе» навсегда. Считаем такой запуск мёртвым.
+export const STALE_RUN_MS = 180_000;
+export const isStale = (r) => Boolean(r) && !r.done && Date.now() - (r.hb ?? r.t0 ?? 0) > STALE_RUN_MS;
+
+export async function settleStale(userId, run) {
+  if (!isStale(run)) return run;
+  Object.assign(run, {
+    done: true, pending: null, live: '', ms: Date.now() - run.t0,
+    error: run.error || 'Ответ не дошёл: запрос оборвался по времени. Можно писать дальше или нажать «Повторить».',
+  });
+  await saveRun(userId, run);
+  return run;
+}
 
 // Что видит клиент: без служебных полей.
 export const publicRun = (r) => r && ({
   id: r.id, text: r.text, live: r.live, trace: r.trace, done: r.done, error: r.error ?? null, ms: r.ms ?? null, model: r.model ?? null,
-  image: r.image ?? null, files: r.files ?? [],
+  image: r.image ?? null, files: r.files ?? [], pending: Boolean(r.pending && !r.image),
 });
 
 export const imgKey = (id) => `appimg.${id}`;   // последняя нарисованная картинка (dataURL) — клиент забирает отдельным запросом
 
 // Вложения из приложения: одна картинка (dataURL, уже уменьшенная клиентом) и до 3 текстовых файлов.
 const IMG_RE = /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
-export const MAX_IMG_CHARS = 3_000_000;
+export const MAX_IMG_CHARS = 5_000_000;
 export const MAX_FILE_CHARS = 60_000;
 
 export function attachments(input) {
@@ -68,3 +85,16 @@ export function appError(e, userId) {
 export function requireOwner(user) {
   if (!isOwner(user.tgId)) throw new EndpointError('Это доступно только админам', { code: 'FORBIDDEN' });
 }
+
+const nowSec = () => Math.floor(Date.now() / 1000);
+
+// «Текущая» картинка приложения: прикреплённая или нарисованная последней. Нужна, чтобы «сделай ярче / добавь…»
+// работало следующим сообщением — как в боте, где последняя картинка живёт AI_IMAGE_TTL секунд.
+export async function recentAppImage(userId) {
+  try {
+    const rec = JSON.parse((await kvGetMany([imgKey(userId)]))[imgKey(userId)] || 'null');
+    if (rec?.dataUrl && nowSec() - (rec.ts ?? 0) <= AI_IMAGE_TTL && rec.dataUrl.length <= 4_000_000) return rec;
+  } catch { /* повреждено — считаем, что картинки нет */ }
+  return null;
+}
+export const rememberAppImage = (userId, runId, dataUrl) => kvSet(imgKey(userId), JSON.stringify({ runId, dataUrl, ts: nowSec() }));

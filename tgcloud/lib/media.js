@@ -191,36 +191,46 @@ async function parseImage(res) {
 }
 
 // Нарисовать новую картинку. size 'auto' не отправляем — у новых моделей это значение по умолчанию.
-export async function generateImage(cfg, prompt, size = 'auto') {
+// compact — для Mini App: просим JPEG (в разы легче PNG: быстрее доезжает до приложения и в память); провайдер не знает параметр — повторяем как обычно.
+const COMPACT = { output_format: 'jpeg', output_compression: 92 };   // почти без потерь, но в разы легче PNG
+const rejectsCompact = (e) => e instanceof AiError && e.code === 'http' && /^400\b/.test(e.detail ?? '') && /output_format|output_compression|unknown parameter|unrecognized|unexpected/i.test(e.detail ?? '');
+
+export async function generateImage(cfg, prompt, size = 'auto', { compact = false } = {}) {
   return withModelFallback(cfg, 'imageModel', AI_IMAGE_FALLBACKS, async (model) => {
-    const body = { model, prompt, n: 1 };
-    if (size && size !== 'auto') body.size = size;
-    const res = await fetch(`${cfg.baseUrl}/images/generations`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-      body: JSON.stringify(body),
-    });
-    return parseImage(res);
+    const call = async (extra) => {
+      const body = { model, prompt, n: 1, ...extra };
+      if (size && size !== 'auto') body.size = size;
+      const res = await fetch(`${cfg.baseUrl}/images/generations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+        body: JSON.stringify(body),
+      });
+      return parseImage(res);
+    };
+    if (!compact) return call({});
+    try { return await call(COMPACT); } catch (e) { if (rejectsCompact(e)) return call({}); throw e; }
   });
 }
-
-// Изменить присланную картинку: добавить/убрать/заменить по описанию.
-export async function editImage(cfg, src, prompt) {
+export async function editImage(cfg, src, prompt, { compact = false } = {}) {
   return withModelFallback(cfg, 'imageModel', AI_IMAGE_FALLBACKS, async (model) => {
-    const form = new FormData();
-    form.append('model', model);
-    form.append('prompt', prompt);
-    form.append('n', '1');
-    form.append('image', new InputFile(src.bytes, `image.${EXT[src.mime] ?? 'png'}`, { type: src.mime }));
-    const res = await fetch(`${cfg.baseUrl}/images/edits`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${cfg.apiKey}` },
-      body: form,
-    });
-    return parseImage(res);
+    const call = async (extra) => {
+      const form = new FormData();
+      form.append('model', model);
+      form.append('prompt', prompt);
+      form.append('n', '1');
+      for (const [k, v] of Object.entries(extra)) form.append(k, String(v));
+      form.append('image', new InputFile(src.bytes, `image.${EXT[src.mime] ?? 'png'}`, { type: src.mime }));
+      const res = await fetch(`${cfg.baseUrl}/images/edits`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cfg.apiKey}` },
+        body: form,
+      });
+      return parseImage(res);
+    };
+    if (!compact) return call({});
+    try { return await call(COMPACT); } catch (e) { if (rejectsCompact(e)) return call({}); throw e; }
   });
 }
-
 // ── Отправка результата ──────────────────────────────────────────────────
 
 const PHOTO_LIMIT = 10 * 1024 * 1024;
